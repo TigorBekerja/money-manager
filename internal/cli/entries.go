@@ -1,0 +1,630 @@
+package cli
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	"money-manager/internal/money"
+	"money-manager/internal/store"
+)
+
+// change is the last edit, delete or restore of this session, kept for undo.
+type change struct {
+	kind   string              // "edit", "delete" or "restore"
+	before store.Transaction   // edit: the old values
+	after  store.Transaction   // edit: the saved new values (UpdatedAt guards the undo)
+	rows   []store.Transaction // delete/restore: the affected entries
+}
+
+type pickMode int
+
+const (
+	pickEdit pickMode = iota
+	pickDelete
+)
+
+func (m pickMode) String() string {
+	if m == pickEdit {
+		return "edit"
+	}
+	return "delete"
+}
+
+const dayLayout = "Monday, 2 January 2006"
+
+func dayStart(t time.Time, loc *time.Location) time.Time {
+	t = t.In(loc)
+	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, loc)
+}
+
+// describe renders an entry as "expense 25,000.50 · 2026-10-17 14:33".
+func (s *session) describe(tx store.Transaction) string {
+	return fmt.Sprintf("%s %s · %s", tx.Kind, money.Format(tx.Amount), tx.OccurredAt.In(s.loc()).Format(timeLayout))
+}
+
+// dayView shows one day's entries and lets the user move between days and pick entries.
+func (s *session) dayView(ctx context.Context, mode pickMode, start time.Time) error {
+	loc := s.loc()
+	today := dayStart(s.now(), loc)
+	day := today
+	if !start.IsZero() {
+		day = dayStart(start, loc)
+	}
+	for {
+		rows, err := s.store.ListBetween(ctx, day, day.AddDate(0, 0, 1))
+		if err != nil {
+			renderError(s.out, s.st, fmt.Errorf("Couldn't load entries: %v", err))
+			return nil
+		}
+		s.renderDay(day, rows, today)
+		s.dayOptions(mode)
+
+	input:
+		for {
+			line, err := s.readLine(mode.String()+"> ", false)
+			if err != nil {
+				return err
+			}
+			in, err := parseDayInput(line, loc)
+			if err != nil {
+				renderError(s.out, s.st, err)
+				continue
+			}
+			switch in.action {
+			case actDone:
+				return nil
+			case actPrev, actNext:
+				var at time.Time
+				var ok bool
+				if in.action == actPrev {
+					at, ok, err = s.store.Nearest(ctx, day, true)
+				} else {
+					at, ok, err = s.store.Nearest(ctx, day.AddDate(0, 0, 1), false)
+				}
+				if err != nil {
+					renderError(s.out, s.st, err)
+					continue
+				}
+				if !ok {
+					if in.action == actPrev {
+						fmt.Fprintln(s.out, indent+"No earlier entries.")
+					} else {
+						fmt.Fprintln(s.out, indent+"No later entries.")
+					}
+					continue
+				}
+				day = dayStart(at, loc)
+				break input
+			case actDay:
+				day = in.day
+				break input
+			case actMonth, actYear:
+				from := time.Date(in.year, in.month, 1, 0, 0, 0, 0, loc)
+				to, label := from.AddDate(0, 1, 0), from.Format("January 2006")
+				if in.action == actYear {
+					to, label = from.AddDate(1, 0, 0), strconv.Itoa(in.year)
+				}
+				at, ok, err := s.store.Nearest(ctx, from, false)
+				if err != nil {
+					renderError(s.out, s.st, err)
+					continue
+				}
+				if !ok || !at.Before(to) {
+					fmt.Fprintf(s.out, "%sNo entries in %s.\n", indent, label)
+					continue
+				}
+				day = dayStart(at, loc)
+				break input
+			case actPick, actEditLine:
+				if err := checkPick(in.nums, len(rows)); err != nil {
+					renderError(s.out, s.st, err)
+					continue
+				}
+				switch {
+				case mode == pickDelete && in.action == actEditLine:
+					renderError(s.out, s.st, errors.New("To change an entry, use edit."))
+					continue
+				case mode == pickDelete:
+					var picked []store.Transaction
+					for _, n := range in.nums {
+						picked = append(picked, rows[n-1])
+					}
+					if err := s.deleteEntries(ctx, in.nums, picked); err != nil {
+						return err
+					}
+				case len(in.nums) != 1:
+					renderError(s.out, s.st, errors.New("Choose one entry to edit."))
+					continue
+				default:
+					var shortcut *AddCmd
+					if in.action == actEditLine {
+						shortcut = &in.edit
+					}
+					if err := s.editEntry(ctx, in.nums[0], rows[in.nums[0]-1], shortcut); err != nil {
+						return err
+					}
+				}
+				break input
+			}
+		}
+	}
+}
+
+func checkPick(nums []int, n int) error {
+	if n == 0 {
+		return errors.New("There are no entries on this day. Use p, n or type a date.")
+	}
+	for _, x := range nums {
+		if x > n {
+			return fmt.Errorf("Choose entry numbers from 1 to %d.", n)
+		}
+	}
+	return nil
+}
+
+func (s *session) renderDay(day time.Time, rows []store.Transaction, today time.Time) {
+	fmt.Fprintln(s.out)
+	fmt.Fprintln(s.out, indent+s.st.bold(day.Format(dayLayout)))
+	if len(rows) == 0 {
+		if day.Equal(today) {
+			fmt.Fprintln(s.out, indent+s.st.dim("No entries today. Press p to go to the last day with entries."))
+		} else {
+			fmt.Fprintln(s.out, indent+s.st.dim("No entries on this day."))
+		}
+		return
+	}
+	var income, expenses int64
+	numW, amtW := len(strconv.Itoa(len(rows))), len("Amount")
+	for _, tx := range rows {
+		amtW = max(amtW, len(money.Format(tx.Amount)))
+		if tx.Kind == store.Income {
+			income += tx.Amount
+		} else {
+			expenses += tx.Amount
+		}
+	}
+	sep := "   "
+	rule := indent + s.st.dim(strings.Repeat("─", 1+numW+3*len(sep)+5+7+amtW))
+	fmt.Fprintln(s.out, rule)
+	fmt.Fprintln(s.out, indent+" "+s.st.dim(padRight("#", numW)+sep+"Time "+sep+padRight("Type", 7)+sep+padLeft("Amount", amtW)))
+	for i, tx := range rows {
+		fmt.Fprintln(s.out, indent+" "+padRight(strconv.Itoa(i+1), numW)+sep+tx.OccurredAt.In(s.loc()).Format("15:04")+sep+
+			s.st.kind(tx.Kind, padRight(string(tx.Kind), 7))+sep+padLeft(money.Format(tx.Amount), amtW))
+	}
+	fmt.Fprintln(s.out, rule)
+	fmt.Fprintf(s.out, "%s Income %s · Expenses %s\n", indent, s.st.green(money.Format(income)), s.st.red(money.Format(expenses)))
+}
+
+func (s *session) dayOptions(mode pickMode) {
+	fmt.Fprintln(s.out)
+	fmt.Fprintln(s.out, indent+"p: previous day · n: next day · or type a date: 2026-10-15 · 2026-09 · 2025")
+	if mode == pickDelete {
+		fmt.Fprintln(s.out, indent+"Choose entry number(s) to delete, e.g. 2 or 1 3 · Enter: done")
+	} else {
+		fmt.Fprintln(s.out, indent+"Choose an entry number to edit, e.g. 2 (or 2 expense 27500 2026-10-16 14:33) · Enter: done")
+	}
+}
+
+func (s *session) deleteEntries(ctx context.Context, nums []int, rows []store.Transaction) error {
+	for i, tx := range rows {
+		fmt.Fprintf(s.out, "%s#%d  %s\n", indent, nums[i], s.describe(tx))
+	}
+	q := "Delete this entry? It stays in trash for 30 days. [y/N]: "
+	if len(rows) > 1 {
+		q = fmt.Sprintf("Delete these %d entries? They stay in trash for 30 days. [y/N]: ", len(rows))
+	}
+	answer, err := s.readLine(q, false)
+	if err != nil {
+		return err
+	}
+	if !isYes(answer) {
+		fmt.Fprintln(s.out, indent+"Nothing deleted.")
+		return nil
+	}
+	ids := make([]int64, len(rows))
+	for i, tx := range rows {
+		ids[i] = tx.ID
+	}
+	deleted, err := s.store.DeleteTransactions(ctx, ids)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		renderError(s.out, s.st, errors.New("One of these entries was changed or deleted elsewhere. Nothing was deleted."))
+		return nil
+	case err != nil:
+		renderError(s.out, s.st, fmt.Errorf("Couldn't delete: %v", err))
+		return nil
+	}
+	s.lastChange = &change{kind: "delete", rows: deleted}
+	fmt.Fprintf(s.out, "%s%s Deleted %s. Type undo to bring it back, or find it in trash.\n", indent, s.st.green("✓"), entries(len(deleted)))
+	return nil
+}
+
+func parseKind(s string) (store.Kind, error) {
+	switch strings.ToLower(strings.TrimPrefix(strings.TrimSpace(s), "/")) {
+	case "income", "pendapatan":
+		return store.Income, nil
+	case "expense", "expenses", "pengeluaran":
+		return store.Expense, nil
+	}
+	return "", errors.New("Type income or expenses (pendapatan / pengeluaran also work).")
+}
+
+// plainAmount renders cents for an input default: "25000.50", "150000".
+func plainAmount(c int64) string {
+	if c%100 == 0 {
+		return strconv.FormatInt(c/100, 10)
+	}
+	return fmt.Sprintf("%d.%02d", c/100, c%100)
+}
+
+func (s *session) editEntry(ctx context.Context, n int, row store.Transaction, shortcut *AddCmd) error {
+	loc := s.loc()
+	kind, amount, at := row.Kind, row.Amount, row.OccurredAt.In(loc)
+	fmt.Fprintf(s.out, "%s#%d  %s\n", indent, n, s.describe(row))
+
+	if shortcut != nil {
+		kind, amount = shortcut.Kind, shortcut.Amount
+		if !shortcut.At.IsZero() {
+			at = shortcut.At
+		}
+	} else {
+		var err error
+		if kind, err = askField(s, fmt.Sprintf("Type [%s]: ", row.Kind), kind, parseKind); err != nil {
+			return err
+		}
+		if amount, err = askField(s, fmt.Sprintf("Amount [%s]: ", plainAmount(row.Amount)), amount, money.Parse); err != nil {
+			return err
+		}
+		parseAt := func(line string) (time.Time, error) { return ParseEditTime(line, at) }
+		if at, err = askField(s, fmt.Sprintf("Date & time [%s]: ", at.Format(timeLayout)), at, parseAt); err != nil {
+			return err
+		}
+	}
+
+	type diff struct{ name, from, to string }
+	var diffs []diff
+	if kind != row.Kind {
+		diffs = append(diffs, diff{"type", string(row.Kind), string(kind)})
+	}
+	if amount != row.Amount {
+		diffs = append(diffs, diff{"amount", money.Format(row.Amount), money.Format(amount)})
+	}
+	if !at.Equal(row.OccurredAt) {
+		diffs = append(diffs, diff{"date & time", row.OccurredAt.In(loc).Format(timeLayout), at.Format(timeLayout)})
+	}
+	if len(diffs) == 0 {
+		fmt.Fprintln(s.out, indent+"No changes.")
+		return nil
+	}
+	fmt.Fprintf(s.out, "%sChange #%d:\n", indent, n)
+	for _, d := range diffs {
+		fmt.Fprintf(s.out, "%s  %s  %s  →  %s\n", indent, padRight(d.name, 11), d.from, d.to)
+	}
+	answer, err := s.readLine("Save? [Y/n]: ", false)
+	if err != nil {
+		return err
+	}
+	if a := strings.TrimSpace(answer); a != "" && !isYes(a) {
+		fmt.Fprintln(s.out, indent+"Nothing changed.")
+		return nil
+	}
+
+	up, err := s.store.UpdateTransaction(ctx, row.ID, kind, amount, at, row.UpdatedAt)
+	switch {
+	case errors.Is(err, store.ErrChanged):
+		renderError(s.out, s.st, errors.New("That entry was changed elsewhere since it was shown. Nothing was saved."))
+		return nil
+	case errors.Is(err, store.ErrNotFound):
+		renderError(s.out, s.st, errors.New("That entry was deleted elsewhere. Nothing was saved."))
+		return nil
+	case err != nil:
+		renderError(s.out, s.st, fmt.Errorf("Couldn't save: %v", err))
+		return nil
+	}
+	s.lastChange = &change{kind: "edit", before: row, after: up}
+	msg := indent + s.st.green("✓") + " Updated."
+	if newDay := dayStart(at, loc); !newDay.Equal(dayStart(row.OccurredAt, loc)) {
+		msg += " It moved to " + newDay.Format(dayLayout) + "."
+	}
+	fmt.Fprintln(s.out, msg)
+	return nil
+}
+
+// askField asks until the answer parses; Enter keeps def.
+func askField[T any](s *session, prompt string, def T, parse func(string) (T, error)) (T, error) {
+	for {
+		line, err := s.readLine(prompt, false)
+		if err != nil {
+			return def, err
+		}
+		if line == "" {
+			return def, nil
+		}
+		v, err := parse(line)
+		if err == nil {
+			return v, nil
+		}
+		renderError(s.out, s.st, err)
+	}
+}
+
+func (s *session) trashView(ctx context.Context) error {
+	restoredAny := false
+	for {
+		rows, err := s.store.ListDeleted(ctx)
+		if err != nil {
+			renderError(s.out, s.st, fmt.Errorf("Couldn't load the trash: %v", err))
+			return nil
+		}
+		fmt.Fprintln(s.out)
+		if len(rows) == 0 {
+			if restoredAny {
+				fmt.Fprintln(s.out, indent+"The trash is now empty.")
+			} else {
+				fmt.Fprintln(s.out, indent+"The trash is empty.")
+			}
+			return nil
+		}
+		s.renderTrash(rows)
+
+		for {
+			line, err := s.readLine("trash> ", false)
+			if err != nil {
+				return err
+			}
+			if l := strings.ToLower(line); l == "" || l == "q" {
+				return nil
+			}
+			nums, err := parseNumbers(line)
+			if err == nil {
+				err = checkPick(nums, len(rows))
+			}
+			if err != nil {
+				renderError(s.out, s.st, errors.New("Choose entry number(s) to restore, e.g. 1 or 1 2, or press Enter."))
+				continue
+			}
+			var picked []store.Transaction
+			for _, n := range nums {
+				picked = append(picked, rows[n-1])
+			}
+			done, err := s.restoreEntries(ctx, nums, picked)
+			if err != nil {
+				return err
+			}
+			restoredAny = restoredAny || done
+			break
+		}
+	}
+}
+
+func (s *session) renderTrash(rows []store.Transaction) {
+	loc := s.loc()
+	numW, amtW := len(strconv.Itoa(len(rows))), len("Amount")
+	for _, tx := range rows {
+		amtW = max(amtW, len(money.Format(tx.Amount)))
+	}
+	sep := "   "
+	head := padRight("#", numW) + sep + padRight("Deleted", 16) + sep + padRight("Date & time", 16) + sep +
+		padRight("Type", 7) + sep + padLeft("Amount", amtW) + sep + "Removed on"
+	rule := indent + s.st.dim(strings.Repeat("─", 1+len(head)))
+	fmt.Fprintln(s.out, indent+s.st.bold(fmt.Sprintf("Deleted entries (kept %d days)", store.TrashDays)))
+	fmt.Fprintln(s.out, rule)
+	fmt.Fprintln(s.out, indent+" "+s.st.dim(head))
+	for i, tx := range rows {
+		fmt.Fprintln(s.out, indent+" "+padRight(strconv.Itoa(i+1), numW)+sep+
+			tx.DeletedAt.In(loc).Format(timeLayout)+sep+tx.OccurredAt.In(loc).Format(timeLayout)+sep+
+			s.st.kind(tx.Kind, padRight(string(tx.Kind), 7))+sep+padLeft(money.Format(tx.Amount), amtW)+sep+
+			tx.DeletedAt.In(loc).AddDate(0, 0, store.TrashDays).Format("2006-01-02"))
+	}
+	fmt.Fprintln(s.out, rule)
+	fmt.Fprintln(s.out, indent+"Choose entry number(s) to restore, e.g. 1 or 1 2 · Enter: done")
+}
+
+func (s *session) restoreEntries(ctx context.Context, nums []int, rows []store.Transaction) (bool, error) {
+	q := fmt.Sprintf("Restore #%d %s? [Y/n]: ", nums[0], s.describe(rows[0]))
+	if len(rows) > 1 {
+		for i, tx := range rows {
+			fmt.Fprintf(s.out, "%s#%d  %s\n", indent, nums[i], s.describe(tx))
+		}
+		q = fmt.Sprintf("Restore these %d entries? [Y/n]: ", len(rows))
+	}
+	answer, err := s.readLine(q, false)
+	if err != nil {
+		return false, err
+	}
+	if a := strings.TrimSpace(answer); a != "" && !isYes(a) {
+		fmt.Fprintln(s.out, indent+"Nothing restored.")
+		return false, nil
+	}
+	ids := make([]int64, len(rows))
+	for i, tx := range rows {
+		ids[i] = tx.ID
+	}
+	restored, err := s.store.RestoreTransactions(ctx, ids)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		renderError(s.out, s.st, errors.New("One of these entries was restored or removed elsewhere. Nothing was restored."))
+		return false, nil
+	case err != nil:
+		renderError(s.out, s.st, fmt.Errorf("Couldn't restore: %v", err))
+		return false, nil
+	}
+	s.lastChange = &change{kind: "restore", rows: restored}
+	fmt.Fprintf(s.out, "%s%s Restored %s.\n", indent, s.st.green("✓"), entries(len(restored)))
+	return true, nil
+}
+
+func (s *session) undo(ctx context.Context) error {
+	c := s.lastChange
+	if c == nil {
+		fmt.Fprintln(s.out, indent+"Nothing to undo.")
+		return nil
+	}
+	summary := func(rows []store.Transaction) string {
+		var parts []string
+		for i, tx := range rows {
+			if i == 3 {
+				parts = append(parts, "…")
+				break
+			}
+			parts = append(parts, fmt.Sprintf("%s %s", tx.Kind, money.Format(tx.Amount)))
+		}
+		return strings.Join(parts, ", ")
+	}
+	var q string
+	switch c.kind {
+	case "edit":
+		q = fmt.Sprintf("Undo the edit? %s goes back to %s [Y/n]: ", s.describe(c.after), s.describe(c.before))
+	case "delete":
+		q = fmt.Sprintf("Undo the delete of %s (%s)? [Y/n]: ", entries(len(c.rows)), summary(c.rows))
+	case "restore":
+		q = fmt.Sprintf("Undo the restore of %s (%s)? They go back to trash. [Y/n]: ", entries(len(c.rows)), summary(c.rows))
+	}
+	answer, err := s.readLine(q, false)
+	if err != nil {
+		return err
+	}
+	if a := strings.TrimSpace(answer); a != "" && !isYes(a) {
+		fmt.Fprintln(s.out, indent+"Not undone.")
+		return nil
+	}
+
+	ids := make([]int64, len(c.rows))
+	for i, tx := range c.rows {
+		ids[i] = tx.ID
+	}
+	switch c.kind {
+	case "edit":
+		b := c.before
+		_, err = s.store.UpdateTransaction(ctx, b.ID, b.Kind, b.Amount, b.OccurredAt, c.after.UpdatedAt)
+	case "delete":
+		_, err = s.store.RestoreTransactions(ctx, ids)
+	case "restore":
+		_, err = s.store.DeleteTransactions(ctx, ids)
+	}
+	s.lastChange = nil
+	switch {
+	case errors.Is(err, store.ErrChanged), errors.Is(err, store.ErrNotFound):
+		renderError(s.out, s.st, errors.New("That changed elsewhere since; undo skipped."))
+	case err != nil:
+		renderError(s.out, s.st, fmt.Errorf("Couldn't undo: %v", err))
+	default:
+		fmt.Fprintln(s.out, indent+s.st.green("✓")+" Undone.")
+	}
+	return nil
+}
+
+// Day-view input.
+
+type dayAction int
+
+const (
+	actDone dayAction = iota
+	actPrev
+	actNext
+	actDay
+	actMonth
+	actYear
+	actPick
+	actEditLine
+)
+
+type dayInput struct {
+	action dayAction
+	day    time.Time
+	year   int
+	month  time.Month
+	nums   []int
+	edit   AddCmd // actEditLine: the new values (At zero = keep date and time)
+}
+
+var (
+	reDate  = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
+	reMonth = regexp.MustCompile(`^(\d{4})-(\d{1,2})$`)
+	reYear  = regexp.MustCompile(`^\d{4}$`)
+)
+
+const dayInputHelp = "Type p, n, a date (2026-10-15), a month (2026-09), a year (2025), or entry number(s)."
+
+// parseDayInput reads one answer in the day view.
+func parseDayInput(line string, loc *time.Location) (dayInput, error) {
+	f := strings.Fields(strings.ToLower(line))
+	if len(f) == 0 || (len(f) == 1 && f[0] == "q") {
+		return dayInput{action: actDone}, nil
+	}
+	if len(f) == 1 {
+		w := f[0]
+		switch {
+		case w == "p":
+			return dayInput{action: actPrev}, nil
+		case w == "n":
+			return dayInput{action: actNext}, nil
+		case reDate.MatchString(w):
+			d, err := parseDate(w, loc)
+			if err != nil {
+				return dayInput{}, err
+			}
+			return dayInput{action: actDay, day: d}, nil
+		case reMonth.MatchString(w):
+			m := reMonth.FindStringSubmatch(w)
+			y, _ := strconv.Atoi(m[1])
+			mon, _ := strconv.Atoi(m[2])
+			if y < 1970 || mon < 1 || mon > 12 {
+				return dayInput{}, fmt.Errorf("Invalid month %q. Use YYYY-MM, e.g. 2026-09", w)
+			}
+			return dayInput{action: actMonth, year: y, month: time.Month(mon)}, nil
+		case reYear.MatchString(w):
+			y, _ := strconv.Atoi(w)
+			if y < 1970 {
+				return dayInput{}, errors.New("Year must be 1970-9999.")
+			}
+			return dayInput{action: actYear, year: y, month: time.January}, nil
+		}
+	}
+	if nums, err := parseNumbers(line); err == nil {
+		return dayInput{action: actPick, nums: nums}, nil
+	}
+	if n, err := strconv.Atoi(f[0]); err == nil && n >= 1 && len(f) >= 2 {
+		rest := f[1:]
+		switch rest[0] {
+		case "pendapatan":
+			rest[0] = "income"
+		case "pengeluaran":
+			rest[0] = "expenses"
+		}
+		cmd, err := Parse(strings.Join(rest, " "), loc)
+		if err != nil {
+			return dayInput{}, err
+		}
+		if add, ok := cmd.(AddCmd); ok {
+			return dayInput{action: actEditLine, nums: []int{n}, edit: add}, nil
+		}
+	}
+	return dayInput{}, errors.New(dayInputHelp)
+}
+
+// parseNumbers reads "2" or "1 3" (positive, duplicates removed, order kept).
+func parseNumbers(line string) ([]int, error) {
+	f := strings.Fields(line)
+	if len(f) == 0 {
+		return nil, errors.New("no numbers")
+	}
+	var nums []int
+	seen := map[int]bool{}
+	for _, w := range f {
+		n, err := strconv.Atoi(strings.TrimPrefix(w, "#"))
+		if err != nil || n < 1 {
+			return nil, errors.New("not a number")
+		}
+		if !seen[n] {
+			seen[n] = true
+			nums = append(nums, n)
+		}
+	}
+	return nums, nil
+}
