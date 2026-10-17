@@ -252,3 +252,52 @@ Format: **Context** (why it came up), **Decision**, **Alternatives**, **Conseque
   column for the same guarantee).
 - **Consequences:** `updated_at` can be a microsecond ahead of the wall clock after rapid
   edits; it's only used for comparisons and audit.
+
+## DLR-021: Notes on entries
+- Date: 2026-10-17 · Status: Accepted (see `docs/NOTES.md`; not built yet)
+- **Context:** User wants to record what each entry was for.
+- **Decision:** optional note (max 200 chars) typed **in double quotes** as the last part of
+  income/expenses: `expenses 25000 "makan siang"`. Spoken notes are the words after the
+  amount, kept as said (only "rupiah" right after the amount is dropped). New column
+  `note TEXT NOT NULL DEFAULT ''`; shown in all tables (only when a row has one), editable in
+  `edit` (`-` removes, shortcut takes `"note"`) and in the voice review with `c <#>`.
+  Searching notes is deferred.
+- **Alternatives:** free text without quotes (shorter, but the user preferred unambiguous
+  quotes); dropping linking words like "buat" from spoken notes.
+- **Consequences:** the voice rule "words after the amount are ignored" becomes "words after
+  the amount are the note"; the misheard-number check moves to the first word only.
+
+## DLR-022: Categories
+- Date: 2026-10-17 · Status: Accepted (see `docs/CATEGORIES.md`; built)
+- **Context:** User wants categories on entries: built-in expense categories food, drink,
+  dessert, laundry, subscription, transport ("transpot" in the request) and income
+  category salary, plus their own.
+- **Decision:** a `categories` table (kind, name, builtin) and `transactions.category_id`
+  with a composite foreign key `(category_id, kind)` so the database refuses a category of
+  the other type. Typed as one word after the amount (`expenses 25000 food "makan siang"`);
+  Indonesian aliases for built-ins (makanan, minuman, gaji, ...) for typing and voice.
+  Built-ins can't be renamed or removed; user categories can (`category add|rename|remove`,
+  remove moves the entries). `list` shows a per-category breakdown.
+- **Alternatives:** a free-text `category` column (typos split totals, no rename);
+  a Postgres enum (can't add user values cleanly); `#food` tags (extra symbol to type);
+  one shared list for both types (lets "salary" appear on an expense).
+- **Consequences:** the parser can't know user categories, so names are resolved in the
+  executor; voice interpretation needs the category list; suggestions need it too.
+- **Confirmed by the user:** optional (no "other"), bare word, unknown word is an error
+  (no create-on-the-fly), spoken category word removed from the note.
+
+## DLR-023: Longer pause ends a spoken entry (2.5 s)
+- Date: 2026-10-17 · Status: Accepted
+- **Context:** The user found spoken notes cut off: speaking slowly, a pause of ~1 s before
+  the note ended the entry at 0.8 s, and the note arrived as a separate, rejected utterance.
+- **Decision:** `audio.DefaultSegmenterConfig` ends an entry after 2.5 s of silence (the
+  user asked for 2-3 s) and allows 30 s per entry (was 15 s). Because a quick "stop" or the
+  next entry now lands in the same transcript, `voice.Split` separates it: a trailing stop
+  word ends listening after the entry, and a new entry starts at a command word followed by
+  an amount ("... makan siang pendapatan dua juta").
+- **Alternatives:** keep 0.8 s and glue a following utterance without a command word onto
+  the previous entry's note (faster, but not what was asked and guesses more); make the
+  pause a `.env` setting (possible later, `AUDIO_SILENCE_MS`).
+- **Consequences:** each entry shows up ~2.5 s after the user stops talking. "stop" as the
+  last word of a note ends listening. Real-Whisper check: a 1.5 s pause before the note
+  keeps it in the entry; "stop" 1 s after the note still stops.

@@ -53,7 +53,7 @@ func TestDeleteFromDayView(t *testing.T) {
 		"1   09:00   income    5,000,000.00",
 		"2   14:33   expense      25,000.50",
 		"Income 5,000,000.00 · Expenses 25,000.50",
-		"p: previous day · n: next day · or type a date: 2026-10-15 · 2026-09 · 2025",
+		"p: previous day, Thu 15 Oct · n: next day, Mon 2 Nov · or type a date: 2026-10-15 · 2026-09 · 2025",
 		"Choose entry number(s) to delete, e.g. 2 or 1 3 · Enter: done",
 		"#2  expense 25,000.50 · 2026-10-17 14:33",
 		"Delete this entry? It stays in trash for 30 days. [y/N]: ",
@@ -64,6 +64,7 @@ func TestDeleteFromDayView(t *testing.T) {
 		"Thursday, 15 October 2026",
 		"Monday, 2 November 2026", // n skips the now-empty 17th
 		"No later entries.",
+		"p: previous day, Thu 15 Oct · no later entries · or type", // on 2 Nov
 	)
 	if n := len(day(t, mem, 2026, 10, 17)); n != 0 {
 		t.Errorf("%d entries left on the 17th", n)
@@ -92,6 +93,10 @@ func TestDayViewNavigation(t *testing.T) {
 		"✗ Type p, n, a date (2026-10-15), a month (2026-09), a year (2025), or entry number(s).",
 		"✗ There are no entries on this day.",
 		"No earlier entries.",
+		// The neighbours with entries are named; another year shows the year.
+		"p: previous day, Thu 15 Oct · n: next day, Sat 17 Oct · or type",     // on the empty 16th
+		"p: previous day, Tue 4 Mar 2025 · n: next day, Thu 15 Oct · or type", // on 9 Oct
+		"no earlier entries · n: next day, Fri 9 Oct 2026 · or type",          // on 4 Mar 2025
 	)
 	if strings.Count(out, "Tuesday, 4 March 2025") < 2 {
 		t.Error("p from 16 Oct should reach 15 Oct, 9 Oct, then 4 March 2025")
@@ -104,13 +109,15 @@ func TestEditByQuestions(t *testing.T) {
 		"edit",
 		"2",
 		"foo", "income", // type: invalid, then income
+		"",             // category: Enter = none
 		"abc", "27500", // amount: invalid, then 27500
 		"2026-10-16", // date only: keeps 14:33
+		"",           // note: Enter = none
 		"",           // Save? Enter = Yes
 		"",
 	}, "\n"))
 	assertContains(t, out,
-		"Choose an entry number to edit, e.g. 2 (or 2 expense 27500 2026-10-16 14:33) · Enter: done",
+		"Choose an entry number to edit, e.g. 2 (or 2 expense 27500 food 2026-10-16 14:33) · Enter: done",
 		"#2  expense 25,000.50 · 2026-10-17 14:33",
 		"Type [expense]: ",
 		"✗ Type income or expenses",
@@ -135,10 +142,10 @@ func TestEditShortcutAndNoChanges(t *testing.T) {
 	mem := seeded(t)
 	out := run(t, mem, strings.Join([]string{
 		"edit",
-		"1 2",                 // two numbers
-		"2 pengeluaran 30000", // shortcut, Indonesian type word, keeps date/time
-		"",                    // Save
-		"1", "", "", "",       // Enter keeps everything
+		"1 2",                   // two numbers
+		"2 pengeluaran 30000",   // shortcut, Indonesian type word, keeps date/time
+		"",                      // Save
+		"1", "", "", "", "", "", // Enter keeps everything (type, category, amount, date, note)
 		"2 expense 1 2026-10-17 25:00", // invalid time in the shortcut
 		"2 expense 1", "n",             // declined
 		"",
@@ -231,12 +238,14 @@ type changingStore struct {
 	sneak bool
 }
 
-func (c *changingStore) UpdateTransaction(ctx context.Context, id int64, kind store.Kind, amount int64, at, expect time.Time) (store.Transaction, error) {
+func (c *changingStore) UpdateTransaction(ctx context.Context, id int64, v store.NewTransaction, expect time.Time) (store.Transaction, error) {
 	if c.sneak {
 		c.sneak = false
-		c.Memory.UpdateTransaction(ctx, id, kind, 12_345, at, expect)
+		other := v
+		other.Amount = 12_345
+		c.Memory.UpdateTransaction(ctx, id, other, expect)
 	}
-	return c.Memory.UpdateTransaction(ctx, id, kind, amount, at, expect)
+	return c.Memory.UpdateTransaction(ctx, id, v, expect)
 }
 
 func TestEditAndUndoAfterOutsideChange(t *testing.T) {
@@ -259,11 +268,13 @@ type outsideAfterEdit struct {
 	done bool
 }
 
-func (o *outsideAfterEdit) UpdateTransaction(ctx context.Context, id int64, kind store.Kind, amount int64, at, expect time.Time) (store.Transaction, error) {
-	tx, err := o.Memory.UpdateTransaction(ctx, id, kind, amount, at, expect)
+func (o *outsideAfterEdit) UpdateTransaction(ctx context.Context, id int64, v store.NewTransaction, expect time.Time) (store.Transaction, error) {
+	tx, err := o.Memory.UpdateTransaction(ctx, id, v, expect)
 	if err == nil && !o.done {
 		o.done = true
-		o.Memory.UpdateTransaction(ctx, id, kind, 777, at, tx.UpdatedAt)
+		other := v
+		other.Amount = 777
+		o.Memory.UpdateTransaction(ctx, id, other, tx.UpdatedAt)
 	}
 	return tx, err
 }

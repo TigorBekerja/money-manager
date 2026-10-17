@@ -32,18 +32,31 @@ var tutorialSteps = []tutorialStep{
 		body: []string{
 			"When you receive money, type income followed by the amount.",
 			"Commas and up to 2 decimals are fine: 5000000, 5,000,000, 5000000.50",
+			"A category after the amount says where it came from (optional).",
 		},
-		try:  func(time.Time) string { return "income 5000000" },
+		try:  func(time.Time) string { return "income 5000000 salary" },
 		done: "Nice! Without a date, the current date and time are used.",
 	},
 	{
 		title: "Record an expense",
 		body: []string{
-			"When you spend money, type expenses followed by the amount.",
+			"When you spend money, type expenses followed by the amount and a category.",
+			"Add a note in double quotes to remember what it was for.",
 			"expense (without the s) works too.",
 		},
-		try:  func(time.Time) string { return "expenses 25000.50" },
+		try:  func(time.Time) string { return `expenses 25000.50 food "makan siang"` },
 		done: "Saved. Amounts are always positive; the type says which way the money went.",
+	},
+	{
+		title: "Categories",
+		body: []string{
+			"Built in: food, drink, dessert, laundry, subscription, transport (expenses)",
+			"and salary (income). Indonesian names work too: makanan, minuman, gaji, ...",
+			"Add your own with: category add expenses parkir",
+			"(rename and remove work on your own categories).",
+		},
+		try:  func(time.Time) string { return "categories" },
+		done: "Each entry can have one category; list shows how much went to each.",
 	},
 	{
 		title: "Add date and time",
@@ -60,7 +73,8 @@ var tutorialSteps = []tutorialStep{
 		title: "See a month",
 		body: []string{
 			"list <month> <year> shows every entry in that month, then total",
-			"income, total expenses and net (income minus expenses).",
+			"income, total expenses, net (income minus expenses) and the totals",
+			"per category.",
 			"Type just list and press Enter twice to see the current month.",
 		},
 		try: func(now time.Time) string {
@@ -83,6 +97,7 @@ var tutorialSteps = []tutorialStep{
 		title: "You're set",
 		body: []string{
 			"/help           show all commands",
+			"categories      see the categories; category add to add your own",
 			"/tutorial       run this guide again",
 			"/audio          speak entries, e.g. \"income dua ratus ribu\"",
 			"/setup-audio    set up voice input (audio-to-text)",
@@ -102,7 +117,8 @@ func runTutorial(ctx context.Context, real *session) error {
 	s := *real
 	s.store = store.NewMemory()
 	s.practice = true
-	s.lastChange = nil // undo in the tutorial must never touch real entries
+	s.lastChange = nil      // undo in the tutorial must never touch real entries
+	s.reloadCategories(ctx) // the practice store's categories
 
 	for i := 0; i < len(tutorialSteps); {
 		step := tutorialSteps[i]

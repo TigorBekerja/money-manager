@@ -60,9 +60,9 @@ func TestSegmenterTwoUtterances(t *testing.T) {
 	stream := concat(
 		noise(time.Second, 60),            // background, includes calibration
 		tone(1500*time.Millisecond, 8000), // entry 1 starts at 1.0 s
-		noise(time.Second, 60),            // pause > 0.8 s
-		tone(time.Second, 8000),           // entry 2 starts at 3.5 s
-		noise(1200*time.Millisecond, 60),
+		noise(3*time.Second, 60),          // pause > 2.5 s
+		tone(time.Second, 8000),           // entry 2 starts at 5.5 s
+		noise(2700*time.Millisecond, 60),
 	)
 	events := push(s, stream)
 
@@ -77,7 +77,7 @@ func TestSegmenterTwoUtterances(t *testing.T) {
 	if len(starts) != 2 || len(utts) != 2 {
 		t.Fatalf("starts=%d utterances=%d, want 2 each", len(starts), len(utts))
 	}
-	for i, want := range []time.Duration{time.Second, 3500 * time.Millisecond} {
+	for i, want := range []time.Duration{time.Second, 5500 * time.Millisecond} {
 		if d := utts[i].At.Sub(t0) - want; d < -40*time.Millisecond || d > 40*time.Millisecond {
 			t.Errorf("utterance %d starts at %v, want ~%v", i+1, utts[i].At.Sub(t0), want)
 		}
@@ -88,6 +88,28 @@ func TestSegmenterTwoUtterances(t *testing.T) {
 	// Includes the pre-roll and at most ~200 ms of trailing silence.
 	if got := time.Duration(len(utts[0].Samples)) * time.Second / SampleRate; got < 1500*time.Millisecond || got > 2200*time.Millisecond {
 		t.Errorf("utterance 1 length %v", got)
+	}
+}
+
+// A slow speaker pauses before the note: up to ~2 s of silence stays inside one entry.
+func TestSegmenterKeepsShortPausesInOneEntry(t *testing.T) {
+	s := NewSegmenter(DefaultSegmenterConfig(), t0)
+	events := push(s, concat(
+		noise(time.Second, 60),
+		tone(1500*time.Millisecond, 8000), // "pengeluaran lima puluh ribu"
+		noise(2*time.Second, 60),          // thinking
+		tone(time.Second, 8000),           // "makan siang"
+		noise(1500*time.Millisecond, 60),  // a pause again
+		tone(500*time.Millisecond, 8000),  // "kantor"
+		noise(3*time.Second, 60),          // done: the entry ends
+	))
+	utts := collect(events, Utterance)
+	if len(utts) != 1 {
+		t.Fatalf("%d utterances, want 1 (pauses under 2.5 s keep the entry going)", len(utts))
+	}
+	// 0.3 s pre-roll + 6.5 s of speech and pauses + ~0.2 s trailing silence.
+	if got := time.Duration(len(utts[0].Samples)) * time.Second / SampleRate; got < 6800*time.Millisecond || got > 7200*time.Millisecond {
+		t.Errorf("utterance length %v, want ~7 s", got)
 	}
 }
 

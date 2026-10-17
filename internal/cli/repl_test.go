@@ -143,7 +143,7 @@ func TestErrorsKeepSessionRunning(t *testing.T) {
 func TestLeadingBOMIgnored(t *testing.T) {
 	mem := store.NewMemory()
 	out := run(t, mem, "\xef\xbb\xbf/tutorial\nq\n")
-	assertContains(t, out, "Tutorial · 1/7")
+	assertContains(t, out, "Tutorial · 1/8")
 	if strings.Contains(out, "Unknown command") {
 		t.Errorf("BOM not stripped:\n%s", out)
 	}
@@ -151,7 +151,8 @@ func TestLeadingBOMIgnored(t *testing.T) {
 
 func TestHelp(t *testing.T) {
 	out := run(t, store.NewMemory(), "/help\n")
-	assertContains(t, out, "income <amount> [YYYY-MM-DD HH:MM]", "/tutorial", "/exit")
+	assertContains(t, out, `income <amount> [category] [YYYY-MM-DD HH:MM] ["note"]`, "category add <income|expenses> <name>",
+		"categories", "expenses 25000 food \"makan siang\"", "/tutorial", "/exit")
 }
 
 func TestEOFExits(t *testing.T) {

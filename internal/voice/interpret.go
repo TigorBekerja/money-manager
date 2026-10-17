@@ -16,19 +16,33 @@ import (
 
 // Draft is a recognised entry waiting in memory for the user's review.
 type Draft struct {
-	Kind     store.Kind
-	Amount   int64     // cents
-	At       time.Time // when the money moved: recording start unless the user changed it
-	Recorded time.Time // when recording of this entry started
-	Heard    string    // transcript, shown in the review
+	Kind       store.Kind
+	Amount     int64     // cents
+	At         time.Time // when the money moved: recording start unless the user changed it
+	Recorded   time.Time // when recording of this entry started
+	Note       string    // the words after the amount (and category), as heard ("makan siang")
+	CategoryID int64     // 0 = none
+	Category   string    // its name ("food" for "makanan")
+	Heard      string    // transcript, shown in the review
+}
+
+// Interpreter turns transcripts into drafts, recognising the given categories by their
+// names and aliases right after the amount.
+type Interpreter struct {
+	Categories []store.Category
 }
 
 // ErrNothingHeard means the transcript had no words (silence, noise, or a known
 // Whisper filler such as "[BLANK_AUDIO]"). Callers usually ignore it quietly.
 var ErrNothingHeard = errors.New("nothing heard")
 
-// Interpret turns a transcript like "income dua ratus ribu" into a Draft at time at.
-func Interpret(text string, at time.Time) (Draft, error) {
+// Interpret turns a transcript like "income dua ratus ribu" into a Draft at time at,
+// without categories.
+func Interpret(text string, at time.Time) (Draft, error) { return Interpreter{}.Interpret(text, at) }
+
+// Interpret turns a transcript like "pengeluaran lima puluh ribu makanan nasi padang" into
+// a Draft at time at: kind, amount, category (taken out of the note) and note.
+func (in Interpreter) Interpret(text string, at time.Time) (Draft, error) {
 	toks := tokenize(text)
 	if len(toks) == 0 || isFiller(toks) {
 		return Draft{}, ErrNothingHeard
@@ -60,7 +74,111 @@ func Interpret(text string, at time.Time) (Draft, error) {
 	if cents > money.MaxCents {
 		return Draft{}, errors.New("the amount is too large")
 	}
-	return Draft{Kind: kind, Amount: cents, At: at, Recorded: at, Heard: strings.TrimSpace(text)}, nil
+	after := rest[p.i:]
+	cat, n := matchCategory(in.Categories, kind, after)
+	if n > 0 {
+		after = after[n:]
+	} else if len(after) > 0 && looksLikeNumberWord(after[0]) {
+		// The words after the amount are the note, but if the first one looks like a
+		// misheard number word ("dua ratus rebu"), the amount is probably wrong: refuse.
+		return Draft{}, fmt.Errorf("couldn't understand the amount %q (%q isn't a number word)", strings.Join(rest, " "), after[0])
+	}
+	note := strings.Join(after, " ")
+	if r := []rune(note); len(r) > store.MaxNoteLen {
+		note = string(r[:store.MaxNoteLen])
+	}
+	return Draft{Kind: kind, Amount: cents, At: at, Recorded: at, Note: note, CategoryID: cat.ID, Category: cat.Name,
+		Heard: strings.TrimSpace(text)}, nil
+}
+
+// matchCategory finds the category of kind said at the start of toks: its name or an
+// alias, the longest match first ("makanan penutup" is dessert, not food). Words of 6+
+// letters may be off by one letter, as Whisper sometimes spells them. It returns the
+// number of words used (0 = no category).
+func matchCategory(cats []store.Category, kind store.Kind, toks []string) (store.Category, int) {
+	var best store.Category
+	bestN, bestEdits := 0, 0
+	for _, c := range cats {
+		if c.Kind != kind {
+			continue
+		}
+		for _, words := range c.Words() {
+			if len(words) > len(toks) || len(words) < bestN {
+				continue
+			}
+			edits, ok := 0, true
+			for i, w := range words {
+				switch d := levenshtein(toks[i], w); {
+				case d == 0:
+				case d == 1 && len([]rune(w)) >= 6:
+					edits++
+				default:
+					ok = false
+				}
+				if !ok {
+					break
+				}
+			}
+			if ok && (len(words) > bestN || edits < bestEdits) {
+				best, bestN, bestEdits = c, len(words), edits
+			}
+		}
+	}
+	return best, bestN
+}
+
+// Split separates a transcript into the entries spoken in it. Since an entry only ends
+// after a long pause (audio.DefaultSegmenterConfig), a quick "stop" or the next entry can
+// end up in the same transcript: "... makan siang. Stop." or "... makan siang pendapatan
+// dua juta". A new entry starts at a command word followed by an amount; stop reports a
+// stop word at the end (removed). A transcript that needs no splitting comes back as is.
+func Split(text string) (entries []string, stop bool) {
+	if IsStop(text) {
+		return nil, true
+	}
+	toks := tokenize(text)
+	trim := func() {
+		for len(toks) > 0 && fillerWords[toks[len(toks)-1]] {
+			toks = toks[:len(toks)-1]
+		}
+	}
+	trim()
+	if n := len(toks); n > 1 && isStopWord(toks[n-1]) {
+		toks, stop = toks[:n-1], true
+		trim()
+	}
+	start := 0
+	for i := 1; i < len(toks); i++ {
+		if !isCommandWord(toks[i]) {
+			continue
+		}
+		if _, err := (&amountParser{toks: toks[i+1:]}).parse(); err != nil {
+			continue // "biaya pengeluaran kantor": part of the note
+		}
+		entries = append(entries, strings.Join(toks[start:i], " "))
+		start = i
+	}
+	if start == 0 && !stop {
+		return []string{text}, false
+	}
+	if start < len(toks) {
+		entries = append(entries, strings.Join(toks[start:], " "))
+	}
+	return entries, stop
+}
+
+// isCommandWord is stricter than commandWord: inside a transcript only the exact words
+// (or pendapatan / pengeluaran one letter off) start a new entry.
+func isCommandWord(w string) bool {
+	switch w {
+	case "income", "expenses", "expense", "pendapatan", "pengeluaran":
+		return true
+	}
+	return levenshtein(w, "pendapatan") <= 1 || levenshtein(w, "pengeluaran") <= 1
+}
+
+func isStopWord(t string) bool {
+	return t == "stop" || t == "setop" || t == "stopp" || t == "berenti" || levenshtein(t, "berhenti") <= 1
 }
 
 // IsStop reports whether the transcript is only a stop command: "stop" or "berhenti"
@@ -74,10 +192,7 @@ func IsStop(text string) bool {
 		return false
 	}
 	for _, t := range toks {
-		switch {
-		case t == "stop" || t == "setop" || t == "stopp" || t == "berenti":
-		case levenshtein(t, "berhenti") <= 1:
-		default:
+		if !isStopWord(t) {
 			return false
 		}
 	}
@@ -269,12 +384,8 @@ func (p *amountParser) parse() (int64, error) {
 	if !found {
 		return 0, fmt.Errorf("no amount heard in %q", strings.Join(p.toks, " "))
 	}
-	// Words after the amount are ignored, unless one looks like a misheard number word
-	// ("dua ratus rebu"): then the amount is probably wrong, so refuse to guess.
-	for _, w := range p.toks[p.i:] {
-		if looksLikeNumberWord(w) {
-			return 0, fmt.Errorf("couldn't understand the amount %q (%q isn't a number word)", strings.Join(p.toks, " "), w)
-		}
+	if p.peek(0) == "rupiah" {
+		p.i++
 	}
 	return total, nil
 }

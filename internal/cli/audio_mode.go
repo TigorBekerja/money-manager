@@ -69,6 +69,9 @@ func (s *session) audioMode(ctx context.Context) error {
 	}
 	ctx, done := s.ops.start(ctx)
 	defer done()
+	if _, err := s.reloadCategories(ctx); err != nil {
+		renderError(s.out, s.st, fmt.Errorf("%v. Spoken categories won't be recognised.", err))
+	}
 
 	fmt.Fprintln(s.out)
 	fmt.Fprint(s.out, indent+"Starting speech model...")
@@ -176,7 +179,10 @@ func (s *session) listen(ctx context.Context, eng voice.Engine, keys KeyReader, 
 			inflight++
 		case voice.Heard:
 			inflight = max(0, inflight-1)
-			s.heard(sl, ev, pending)
+			parts, _ := voice.Split(ev.Text)
+			for _, p := range parts {
+				s.heard(sl, voice.Event{Kind: voice.Heard, At: ev.At, Text: p}, pending)
+			}
 		case voice.Failed:
 			if !ev.Fatal {
 				inflight = max(0, inflight-1)
@@ -197,10 +203,7 @@ func (s *session) listen(ctx context.Context, eng voice.Engine, keys KeyReader, 
 		sl.draw(s.st.dim("Finishing the last entry..."))
 		l.Finish()
 		for ev := range l.Events() {
-			if ev.Kind == voice.Heard && voice.IsStop(ev.Text) {
-				continue
-			}
-			if ev.Kind == voice.Heard || ev.Kind == voice.Failed {
+			if ev.Kind == voice.Heard || ev.Kind == voice.Failed { // a stop word here is just dropped
 				handle(ev)
 				sl.draw(s.st.dim("Finishing the last entry..."))
 			}
@@ -215,8 +218,8 @@ func (s *session) listen(ctx context.Context, eng voice.Engine, keys KeyReader, 
 				waitKey()
 				return listenFailed, nil
 			}
-			if ev.Kind == voice.Heard && voice.IsStop(ev.Text) {
-				inflight = max(0, inflight-1)
+			if _, stop := voice.Split(ev.Text); ev.Kind == voice.Heard && stop {
+				handle(ev) // entries said in the same breath as the stop word
 				sl.println(fmt.Sprintf("%s%s heard %q: stopped listening.", indent, s.st.dim("■"), ev.Text))
 				finish()
 				// A key read is still waiting; release it before the review reads input.
@@ -261,7 +264,7 @@ func (s *session) listen(ctx context.Context, eng voice.Engine, keys KeyReader, 
 }
 
 func (s *session) heard(sl *statusLine, ev voice.Event, pending *[]voice.Draft) {
-	d, err := voice.Interpret(ev.Text, ev.At.In(s.loc()))
+	d, err := voice.Interpreter{Categories: s.cats}.Interpret(ev.Text, ev.At.In(s.loc()))
 	switch {
 	case errors.Is(err, voice.ErrNothingHeard):
 		return
@@ -270,9 +273,16 @@ func (s *session) heard(sl *statusLine, ev voice.Event, pending *[]voice.Draft) 
 		return
 	}
 	*pending = append(*pending, d)
-	sl.println(fmt.Sprintf("%s%s #%-3d %s %s · %s   %s", indent, s.st.green("✓"), len(*pending),
+	category, note := "", ""
+	if d.Category != "" {
+		category = d.Category + " · "
+	}
+	if d.Note != "" {
+		note = shortNote(d.Note) + "   "
+	}
+	sl.println(fmt.Sprintf("%s%s #%-3d %s %s · %s%s   %s%s", indent, s.st.green("✓"), len(*pending),
 		s.st.kind(d.Kind, padRight(string(d.Kind), 7)), padLeft(money.Format(d.Amount), 14),
-		d.At.Format("15:04"), s.st.dim(fmt.Sprintf("heard %q", d.Heard))))
+		category, d.At.Format("15:04"), note, s.st.dim(fmt.Sprintf("heard %q", d.Heard))))
 }
 
 // review shows all pending entries and handles t / d / r / y / n. It reports whether the
@@ -308,17 +318,32 @@ func (s *session) review(ctx context.Context, pending *[]voice.Draft) (bool, err
 				}
 			}
 			s.renderPending(*pending)
-		case cmd == "t" || cmd == "d":
+		case cmd == "t" || cmd == "d" || cmd == "c" || cmd == "k":
 			i, err := entryIndex(arg, len(*pending))
 			if err != nil {
 				renderError(s.out, s.st, err)
 				continue
 			}
-			if cmd == "t" {
+			switch cmd {
+			case "t":
 				if err := s.editTime(&(*pending)[i], i); err != nil {
 					return false, err
 				}
-			} else {
+			case "c":
+				d := &(*pending)[i]
+				fmt.Fprintf(s.out, "%s#%d %s %s\n", indent, i+1, d.Kind, money.Format(d.Amount))
+				if d.Note, err = s.askNote(d.Note); err != nil {
+					return false, err
+				}
+			case "k":
+				d := &(*pending)[i]
+				fmt.Fprintf(s.out, "%s#%d %s %s\n", indent, i+1, d.Kind, money.Format(d.Amount))
+				c, err := s.askCategory(ctx, d.Kind, store.Category{ID: d.CategoryID, Kind: d.Kind, Name: d.Category})
+				if err != nil {
+					return false, err
+				}
+				d.CategoryID, d.Category = c.ID, c.Name
+			default:
 				*pending = append((*pending)[:i], (*pending)[i+1:]...)
 				fmt.Fprintf(s.out, "%s%s Removed #%d.\n", indent, s.st.green("✓"), i+1)
 				if len(*pending) == 0 {
@@ -332,9 +357,13 @@ func (s *session) review(ctx context.Context, pending *[]voice.Draft) (bool, err
 		case cmd == "y":
 			rows := make([]store.NewTransaction, len(*pending))
 			for i, d := range *pending {
-				rows[i] = store.NewTransaction{Kind: d.Kind, Amount: d.Amount, OccurredAt: d.At}
+				rows[i] = store.NewTransaction{Kind: d.Kind, Amount: d.Amount, OccurredAt: d.At, Note: d.Note, CategoryID: d.CategoryID}
 			}
 			if _, err := s.store.AddTransactions(ctx, rows); err != nil {
+				if errors.Is(err, store.ErrCategoryKind) {
+					s.reloadCategories(ctx)
+					err = errors.New("a category was removed elsewhere; change it with k <#>")
+				}
 				renderError(s.out, s.st, fmt.Errorf("Couldn't save: %v. Nothing was saved; the entries are still here.", err))
 				continue
 			}
@@ -352,7 +381,7 @@ func (s *session) review(ctx context.Context, pending *[]voice.Draft) (bool, err
 				return false, nil
 			}
 		default:
-			renderError(s.out, s.st, errors.New("Type t, t <#>, d <#>, r, y or n."))
+			renderError(s.out, s.st, errors.New("Type t, t <#>, k <#>, c <#>, d <#>, r, y or n."))
 		}
 	}
 }
@@ -403,22 +432,33 @@ func (s *session) renderPending(pending []voice.Draft) {
 	}
 	numW := len(strconv.Itoa(len(pending)))
 	sep := "   "
-	rowW := numW + 3*len(sep) + heardW + 7 + amtW + 2 + len(timeLayout) + 2
+	notes := make([]string, len(pending))
+	cats := make([]string, len(pending))
+	for i, d := range pending {
+		notes[i], cats[i] = d.Note, d.Category
+	}
+	cc := newCategoryColumnOf(cats, sep)
+	nc := newNoteColumnOf(notes, " ")
+	const dateW = len(timeLayout) + 2 // room for the " *" mark
+	rowW := numW + 3*len(sep) + heardW + 7 + cc.width() + amtW + 2 + dateW + nc.width()
 	rule := indent + s.st.dim(strings.Repeat("─", rowW))
 
 	fmt.Fprintln(s.out)
 	fmt.Fprintln(s.out, indent+s.st.bold("Recorded entries (NOT saved yet)"))
 	fmt.Fprintln(s.out, rule)
 	fmt.Fprintln(s.out, indent+" "+s.st.dim(padRight("#", numW)+sep+padRight("Heard", heardW)+sep+
-		padRight("Type", 7)+sep+padLeft("Amount", amtW)+"  Date & time"))
+		padRight("Type", 7)+sep+cc.header()+padLeft("Amount", amtW)+"  "+padRight("Date & time", dateW)+nc.header()))
 	for i, d := range pending {
-		mark := ""
+		date := d.At.Format(timeLayout)
 		if !d.At.Equal(d.Recorded) {
-			mark = " *"
+			date += " *"
+		}
+		if nc.w > 0 {
+			date = padRight(date, dateW)
 		}
 		fmt.Fprintln(s.out, indent+" "+padRight(strconv.Itoa(i+1), numW)+sep+padRight(heard(d), heardW)+sep+
-			s.st.kind(d.Kind, padRight(string(d.Kind), 7))+sep+padLeft(money.Format(d.Amount), amtW)+"  "+
-			d.At.Format(timeLayout)+mark)
+			s.st.kind(d.Kind, padRight(string(d.Kind), 7))+sep+cc.cell(d.Category)+padLeft(money.Format(d.Amount), amtW)+"  "+
+			date+nc.cell(d.Note))
 	}
 	fmt.Fprintln(s.out, rule)
 	fmt.Fprintf(s.out, "%s Income %s · Expenses %s\n", indent, s.st.green(money.Format(income)), s.st.red(money.Format(expenses)))
@@ -432,8 +472,8 @@ func (s *session) renderPending(pending []voice.Draft) {
 
 func (s *session) reviewOptions() {
 	fmt.Fprintln(s.out)
-	fmt.Fprintln(s.out, indent+"t: set date & time of every entry · t <#>: one entry · d <#>: delete")
-	fmt.Fprintln(s.out, indent+"r: record more · y: save all · n: discard all")
+	fmt.Fprintln(s.out, indent+"t: set date & time of every entry · t <#>: one entry · k <#>: category · c <#>: note")
+	fmt.Fprintln(s.out, indent+"d <#>: delete · r: record more · y: save all · n: discard all")
 }
 
 func entryIndex(arg string, n int) (int, error) {

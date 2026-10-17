@@ -17,14 +17,19 @@ import (
 
 // Store is implemented by store.Postgres and store.Memory.
 type Store interface {
-	AddTransaction(ctx context.Context, kind store.Kind, amount int64, occurredAt time.Time) (store.Transaction, error)
+	AddTransaction(ctx context.Context, v store.NewTransaction) (store.Transaction, error)
 	AddTransactions(ctx context.Context, rows []store.NewTransaction) ([]store.Transaction, error)
 	ListBetween(ctx context.Context, from, to time.Time) ([]store.Transaction, error)
 	Nearest(ctx context.Context, t time.Time, before bool) (time.Time, bool, error)
-	UpdateTransaction(ctx context.Context, id int64, kind store.Kind, amount int64, occurredAt, expectUpdatedAt time.Time) (store.Transaction, error)
+	UpdateTransaction(ctx context.Context, id int64, v store.NewTransaction, expectUpdatedAt time.Time) (store.Transaction, error)
 	DeleteTransactions(ctx context.Context, ids []int64) ([]store.Transaction, error)
 	RestoreTransactions(ctx context.Context, ids []int64) ([]store.Transaction, error)
 	ListDeleted(ctx context.Context) ([]store.Transaction, error)
+	Categories(ctx context.Context) ([]store.Category, error)
+	AddCategory(ctx context.Context, kind store.Kind, name string) (store.Category, error)
+	RenameCategory(ctx context.Context, id int64, name string) (store.Category, error)
+	RemoveCategory(ctx context.Context, id, moveTo int64) (int, error)
+	CategoryCounts(ctx context.Context) (map[int64]int, error)
 }
 
 // LineReader reads one line of input. With complete set, command suggestions, Tab
@@ -46,7 +51,12 @@ type REPL struct {
 	Voice  VoiceInput // optional; enables /audio
 
 	ops ops
+	sug suggester
 }
+
+// Suggest is Suggest with the categories of the running session, for completing a
+// category after the amount. Use it as the line editor's Suggest.
+func (r *REPL) Suggest(line string) lineedit.Suggestions { return suggest(line, r.sug.cats) }
 
 // Interrupt cancels the running long operation (a download), if any. It reports
 // whether there was one, so the caller can otherwise treat Ctrl+C as quit.
@@ -67,8 +77,10 @@ func (r *REPL) Run(ctx context.Context) error {
 		audio: r.Audio,
 		voice: r.Voice,
 		ops:   &r.ops,
+		sug:   &r.sug,
 	}
 	renderBanner(s.out, s.st, r.Banner)
+	s.categories(ctx) // for suggestions; errors show up when categories are used
 
 	for {
 		line, err := s.readLine("> ", true)
@@ -87,7 +99,9 @@ func (r *REPL) Run(ctx context.Context) error {
 		case ExitCmd:
 			return s.bye(nil)
 		case TutorialCmd:
-			if err := runTutorial(ctx, s); err != nil {
+			err := runTutorial(ctx, s)
+			s.reloadCategories(ctx) // the tutorial's practice categories are gone
+			if err != nil {
 				return s.bye(err)
 			}
 		default:
@@ -111,6 +125,8 @@ type session struct {
 	audio      AudioTools
 	voice      VoiceInput
 	ops        *ops
+	cats       []store.Category // cache; nil = not loaded (see categories)
+	sug        *suggester
 }
 
 func (s *session) loc() *time.Location { return s.now().Location() }
@@ -174,13 +190,27 @@ func (s *session) exec(ctx context.Context, cmd Command) error {
 			return s.setupAudio(ctx)
 		}
 		return s.audioStatus(ctx)
+	case CategoriesCmd:
+		return s.showCategories(ctx)
+	case CategoryCmd:
+		return s.categoryCmd(ctx, c)
 	case AddCmd:
+		cat, err := s.categoryOf(ctx, c)
+		if err != nil {
+			renderError(s.out, s.st, err)
+			return nil
+		}
 		at := c.At
 		if at.IsZero() {
 			at = s.now().Truncate(time.Minute)
 		}
-		tx, err := s.store.AddTransaction(ctx, c.Kind, c.Amount, at)
-		if err != nil {
+		tx, err := s.store.AddTransaction(ctx, store.NewTransaction{Kind: c.Kind, Amount: c.Amount, OccurredAt: at, Note: c.Note, CategoryID: cat.ID})
+		switch {
+		case errors.Is(err, store.ErrCategoryKind):
+			s.reloadCategories(ctx)
+			renderError(s.out, s.st, fmt.Errorf("The category %s was just removed elsewhere. Nothing was saved.", cat.Name))
+			return nil
+		case err != nil:
 			renderError(s.out, s.st, fmt.Errorf("Couldn't save: %v", err))
 			return nil
 		}

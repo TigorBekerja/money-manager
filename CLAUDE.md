@@ -16,6 +16,8 @@ Docs:
 - `docs/DLR.md`: decision log; add an entry whenever a non-obvious decision is made or reversed
 - `docs/AUDIO.md`: `/audio` voice entry design (built)
 - `docs/EDIT.md`: edit/delete saved entries, trash, undo (built)
+- `docs/NOTES.md`: notes on entries (built)
+- `docs/CATEGORIES.md`: categories on entries (built)
 
 ## Commands
 
@@ -85,6 +87,20 @@ docs/                        DESIGN, PLAN, DLR
 - A leading `/` is optional on every command. Write meta commands as `/help`, `/tutorial`,
   `/exit` in user-facing text; data commands stay bare (`income`, `expenses`, `list`).
 - Always use query parameters (`$1`, `$2`), never string-built SQL.
+- Notes: typed in double quotes as the last part of income/expenses (`splitNote` in
+  `cli/parse.go`); max `store.MaxNoteLen` (200) characters, also enforced by a database
+  CHECK. Every table shows the note column only when a row has a note (`noteColumn`).
+  `store.NewTransaction` carries all editable fields; pass it whole to Add/Update so a
+  field like the note can't be dropped by accident.
+- Categories: a `categories` table (kind, name, builtin) and `transactions.category_id`
+  with a composite foreign key `(category_id, kind)`, so the database refuses a category of
+  the other type (`store.ErrCategoryKind`). Built-ins and their Indonesian aliases live in
+  `store/categories.go` (`builtinCategories`) and must match migration 004; they can't be
+  renamed or removed. The parser only keeps the typed word (`AddCmd.Category`); the
+  executor resolves it (`session.categoryOf`), since only the store knows user categories.
+  The session caches the list (`session.categories`); reload it after any category change.
+  Entries read their category name through a join (`fromEntries` / `returning` in
+  `queries.go`), so renames need no entry updates.
 - Deletes are soft (`deleted_at`). Every normal query (list, totals, day view, navigation)
   must filter `deleted_at IS NULL`; only the trash queries look at deleted rows. Rows in the
   trash longer than `store.TrashDays` (30) are purged at startup.

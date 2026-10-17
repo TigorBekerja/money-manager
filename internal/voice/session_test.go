@@ -104,9 +104,9 @@ func TestSessionTranscribesEachEntry(t *testing.T) {
 	s := Listen(context.Background(), src, tr, audio.DefaultSegmenterConfig(), func() time.Time { return start })
 	src.feed(quiet(time.Second))
 	src.feed(talk(time.Second)) // starts at 1 s
-	src.feed(quiet(time.Second))
-	src.feed(talk(time.Second)) // starts at 3 s
-	src.feed(quiet(time.Second))
+	src.feed(quiet(3 * time.Second))
+	src.feed(talk(time.Second)) // starts at 5 s
+	src.feed(quiet(3 * time.Second))
 	time.Sleep(100 * time.Millisecond)
 	s.Finish()
 	events := drain(t, s)
@@ -120,7 +120,7 @@ func TestSessionTranscribesEachEntry(t *testing.T) {
 	if len(heard) != 2 || heard[0].Text != "income dua ratus ribu" || heard[1].Text != "pengeluaran lima puluh ribu" {
 		t.Fatalf("heard = %+v\nall: %v", heard, kinds(events))
 	}
-	for i, want := range []time.Duration{time.Second, 3 * time.Second} {
+	for i, want := range []time.Duration{time.Second, 5 * time.Second} {
 		if d := heard[i].At.Sub(start) - want; d.Abs() > 50*time.Millisecond {
 			t.Errorf("entry %d At = %v, want ~%v", i+1, heard[i].At.Sub(start), want)
 		}
@@ -158,7 +158,7 @@ func TestSessionCloseAborts(t *testing.T) {
 	s := Listen(context.Background(), src, tr, audio.DefaultSegmenterConfig(), func() time.Time { return start })
 	src.feed(quiet(time.Second))
 	src.feed(talk(time.Second))
-	src.feed(quiet(time.Second))
+	src.feed(quiet(3 * time.Second)) // the entry ends and its transcription blocks
 	time.Sleep(100 * time.Millisecond)
 	done := make(chan struct{})
 	go func() { s.Close(); close(done) }()

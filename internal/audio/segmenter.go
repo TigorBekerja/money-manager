@@ -19,13 +19,16 @@ type SegmenterConfig struct {
 	MinLevel    float64       // lowest RMS treated as speech, protects against a silent calibration
 }
 
+// DefaultSegmenterConfig is tuned for entries with a note. The pause that ends an entry
+// is long enough for a slow speaker to stop and think before the note ("... ribu, eh,
+// makan siang") without the entry ending there (was 0.8 s, see DLR-023).
 func DefaultSegmenterConfig() SegmenterConfig {
 	return SegmenterConfig{
 		Calibration: 500 * time.Millisecond,
-		Silence:     800 * time.Millisecond,
+		Silence:     2500 * time.Millisecond,
 		PreRoll:     300 * time.Millisecond,
 		MinSpeech:   250 * time.Millisecond,
-		MaxLength:   15 * time.Second,
+		MaxLength:   30 * time.Second,
 		MinLevel:    300,
 	}
 }

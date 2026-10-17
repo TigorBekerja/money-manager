@@ -45,10 +45,14 @@ Decisions confirmed by the user on 2026-10-17:
   ──────────────────────────────────────────
    Income 5,000,000.00 · Expenses 25,000.50
 
-  p: previous day · n: next day · or type a date: 2026-10-15 · 2026-09 · 2025
+  p: previous day, Thu 15 Oct · n: next day, Mon 19 Oct · or type a date: 2026-10-15 · 2026-09 · 2025
   Choose entry number(s) to delete, e.g. 2 or 1 3 · Enter: done
   delete> _
 ```
+
+The options line names the nearest earlier and later days with entries (what p and n
+open), with the year if it differs; "no earlier entries" / "no later entries" when there
+are none.
 
 - Entries of that day, oldest first, numbered from 1, with the day's totals.
 - `p` / `n`: jump to the previous / next day **that has entries** (empty days are skipped).

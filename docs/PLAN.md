@@ -105,6 +105,37 @@ See `DESIGN.md` for the spec and `DLR.md` for decisions. Tick boxes as work land
 - [x] Suggestions, `/help`, tutorial step "Fix a mistake"
 - [x] Tests (EDIT.md §9), incl. outside-change and rapid-edit version checks
 
+## Phase 12: notes on entries (built, see NOTES.md)
+- [x] Decisions: notes in double quotes; spoken notes kept as said; review `c <#>`; search later
+- [x] Migration `003_notes.sql` (`note`, length CHECK), applied to the real DB
+- [x] Store: `Note` field, `AddTransaction(NewTransaction)`, note in `UpdateTransaction`, length validation
+- [x] Parser: quote-aware split, `"note"` last, quote errors and hint, date-without-time stays an error
+- [x] Voice interpreter: note from trailing words; misheard-number guard only on the first word
+- [x] Screens: note column (only when present, truncated), save message, edit question (`-` removes), shortcut, review `c <#>`
+- [x] Help, hints (none while typing inside quotes), tutorial examples
+- [x] Tests (NOTES.md §7); end-to-end WAV through real Whisper: note extracted, see NOTES.md "As built" for the TTS-accent result
+
+## Phase 13: categories (built, see CATEGORIES.md)
+- [x] Decisions: optional category; bare word after the amount; unknown word is an error with "Did you mean"; spoken category word taken out of the note
+- [x] Migration `004_categories.sql` (table, 7 built-ins, `category_id`, composite FK), applied to the real DB with the read-only check
+- [x] Store: `Category`, `Categories` / `AddCategory` / `RenameCategory` / `RemoveCategory` / `CategoryCounts`, `CategoryID` on entries (+ name via join), kind check, built-in aliases; Memory seeded; shared tests
+- [x] Parser: `[category]` after the amount (or after date/time), `none`, `categories`, `category add|rename|remove`
+- [x] Executor: resolve name/alias per type, wrong-type and unknown errors with "Did you mean"
+- [x] Screens: Category column (list, day view, trash, review), breakdown under the month totals, save/describe lines
+- [x] Edit: category question after type, type change clears a misfit, shortcut, undo
+- [x] `categories` screen; remove flow (move entries, confirm default No)
+- [x] Voice: category from the words after the amount (aliases, multi-word, fuzzy 6+), review `k <#>`
+- [x] Help, suggestions (category names after the amount), tutorial (8 steps)
+- [x] Tests (CATEGORIES.md §10)
+
+## Phase 14: quality of life (built)
+- [x] Day view (edit/delete) names the nearest earlier/later days with entries next to p / n ("p: previous day, Thu 15 Oct"), year shown when it differs, "no earlier/later entries" otherwise
+- [x] Voice: an entry ends after 2.5 s of silence (was 0.8 s), max 30 s (DLR-023)
+- [x] `voice.Split`: a trailing "stop" / "berhenti" or a next entry in the same transcript is separated
+- [x] Tests: day-view labels, segmenter keeps short pauses in one entry, Split table, run-together review; real Whisper: 1.5 s pause before the note keeps it, "stop" 1 s later still stops
+- [ ] User test with their own voice on the real microphone
+
 ## Later (not v1)
-Notes on transactions · categories · delete/edit last entry · yearly summary · CSV export ·
+`find <text>` to search notes · `list 10 2026 food` (one category) · budget per category ·
+yearly summary · CSV export / backup ·
 one-shot mode (`money-manager-vandika income 5000`) · Bubble Tea UI

@@ -48,16 +48,24 @@ func TestEndToEndWAV(t *testing.T) {
 	for ev := range l.Events() {
 		switch ev.Kind {
 		case Heard:
-			d, err := Interpret(ev.Text, ev.At)
-			if IsStop(ev.Text) {
-				t.Logf("heard %q → stop", ev.Text)
+			parts, stop := Split(ev.Text)
+			t.Logf("heard %q (starts %.1fs into the file)", ev.Text, ev.At.Sub(start).Seconds())
+			for _, p := range parts {
+				d, err := Interpret(p, ev.At)
+				if err != nil {
+					t.Logf("  %q → %v", p, err)
+					got = append(got, "error")
+					continue
+				}
+				t.Logf("  %q → %s %d %q", p, d.Kind, d.Amount/100, d.Note)
+				entry := string(d.Kind) + " " + strconv.FormatInt(d.Amount/100, 10)
+				if d.Note != "" {
+					entry += " " + d.Note
+				}
+				got = append(got, entry)
+			}
+			if stop {
 				got = append(got, "stop")
-			} else if err != nil {
-				t.Logf("heard %q → %v", ev.Text, err)
-				got = append(got, "error")
-			} else {
-				t.Logf("heard %q → %s %d (starts %.1fs into the file)", ev.Text, d.Kind, d.Amount/100, ev.At.Sub(start).Seconds())
-				got = append(got, string(d.Kind)+" "+strconv.FormatInt(d.Amount/100, 10))
 			}
 			if len(got) == len(want) {
 				l.Finish()

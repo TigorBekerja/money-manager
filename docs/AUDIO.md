@@ -93,11 +93,13 @@ Status line states:
 |---|---|
 | waiting for speech | `● Ready for entry #N · speak now` + mic level meter |
 | speech detected | `◉ Recording entry #N...` (red) + level meter |
-| after ~0.8 s silence | `… Understanding entry #N...` |
+| after ~2.5 s silence | `… Understanding entry #N...` |
 | result | permanent line above (`✓ #N ...` or `✗ ...`), then back to `● Ready for entry #N+1` |
 
 Rules:
-- An entry ends automatically after ~0.8 s of silence (max 15 s per entry).
+- An entry ends automatically after ~2.5 s of silence (max 30 s per entry; was 0.8 s / 15 s, see DLR-023).
+  Shorter pauses (thinking before the note) stay inside the entry. A "stop" or a next entry
+  said within that time lands in the same transcript; `voice.Split` separates them.
 - The entry's date/time is **the moment recording of that entry started**.
 - Background noise is ignored using a noise-floor calibration in the first ~0.5 s
   ("Calibrating microphone, stay quiet..."). Speech that doesn't parse is shown as `✗` and
@@ -197,7 +199,7 @@ Not spoken. Defaults to the moment recording of the entry started; changed in re
  audio.Recorder  (Windows waveIn API via golang.org/x/sys/windows, no cgo)
      │  frames + level
      ▼
- audio.Segmenter (noise-floor calibration, speech start, end after ~0.8 s silence, max 15 s)
+ audio.Segmenter (noise-floor calibration, speech start, end after ~2.5 s silence, max 30 s)
      │  Utterance{WAV, StartedAt}            ──► status line: Ready / Recording / Understanding
      ▼
  stt.Transcriber ──► whisper-server.exe on 127.0.0.1 (started by the app on first /audio)
@@ -255,7 +257,7 @@ func Interpret(text string, at time.Time) (Draft, error)
 WHISPER_SERVER=C:\Users\vandi\AppData\Local\money-manager-vandika\whisper\whisper-server.exe
 WHISPER_MODEL=C:\Users\vandi\AppData\Local\money-manager-vandika\whisper\ggml-large-v3-turbo-q5_0.bin
 # WHISPER_GPU=auto          auto | off
-# AUDIO_SILENCE_MS=800      pause that ends an entry
+# AUDIO_SILENCE_MS=2500     pause that ends an entry (not built)
 ```
 
 ## 7. Testing

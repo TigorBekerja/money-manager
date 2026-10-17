@@ -102,8 +102,10 @@ func (e *fakeEngine) Listen(ctx context.Context) (voice.Listening, error) {
 		}
 		// After a spoken stop, the next key must come from Wake (or, without Wake
 		// support, from the input after listening finished).
-		endsWithStop := len(script) > 0 && script[len(script)-1].Kind == voice.Heard &&
-			voice.IsStop(script[len(script)-1].Text)
+		endsWithStop := false
+		if len(script) > 0 && script[len(script)-1].Kind == voice.Heard {
+			_, endsWithStop = voice.Split(script[len(script)-1].Text)
+		}
 		if !endsWithStop {
 			close(gate)
 		}
@@ -207,7 +209,8 @@ func TestAudioRecordEditAndSave(t *testing.T) {
 		"1   income dua ratus ribu",
 		"Income 200,000.00 · Expenses 55,000.00",
 		"Date & time is when each entry was recorded",
-		"t: set date & time of every entry · t <#>: one entry · d <#>: delete",
+		"t: set date & time of every entry · t <#>: one entry · k <#>: category · c <#>: note",
+		"d <#>: delete · r: record more · y: save all · n: discard all",
 		"#1 income      200,000.00    Date & time [2026-10-17 14:32]: ",
 		`✗ Invalid time "25:00"`,
 		"2026-10-15 09:00 *",
@@ -283,6 +286,22 @@ func TestAudioVoiceStop(t *testing.T) {
 		if n := len(listAll(t, run.mem)); n != 1 {
 			t.Errorf("saved %d rows, want 1", n)
 		}
+	}
+}
+
+// With the long pause, "stop" or the next entry can come in the same transcript as an
+// entry: both are still understood.
+func TestAudioRunTogether(t *testing.T) {
+	script := speechScript("Pengeluaran lima puluh ribu makan siang, pendapatan dua juta gaji. Stop.")
+	run := runVoice(t, nil, [][]voice.Event{script}, "/audio\ny\n")
+	assertContains(t, run.out,
+		`✓ #1   expense      50,000.00 · 14:32   makan siang   heard "pengeluaran lima puluh ribu makan siang"`,
+		`✓ #2   income    2,000,000.00 · salary · 14:32   heard "pendapatan dua juta gaji"`,
+		`■ heard "Pengeluaran lima puluh ribu makan siang, pendapatan dua juta gaji. Stop.": stopped listening.`,
+		"✓ Saved 2 entries.")
+	rows := listAll(t, run.mem)
+	if len(rows) != 2 || rows[0].Note != "makan siang" || rows[1].Category != "salary" || rows[1].Note != "" {
+		t.Errorf("saved = %+v", rows)
 	}
 }
 

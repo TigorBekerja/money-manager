@@ -42,9 +42,17 @@ func dayStart(t time.Time, loc *time.Location) time.Time {
 	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, loc)
 }
 
-// describe renders an entry as "expense 25,000.50 · 2026-10-17 14:33".
+// describe renders an entry as "expense 25,000.50 · food · 2026-10-17 14:33 · makan siang".
 func (s *session) describe(tx store.Transaction) string {
-	return fmt.Sprintf("%s %s · %s", tx.Kind, money.Format(tx.Amount), tx.OccurredAt.In(s.loc()).Format(timeLayout))
+	d := fmt.Sprintf("%s %s · ", tx.Kind, money.Format(tx.Amount))
+	if tx.Category != "" {
+		d += tx.Category + " · "
+	}
+	d += tx.OccurredAt.In(s.loc()).Format(timeLayout)
+	if tx.Note != "" {
+		d += " · " + tx.Note
+	}
+	return d
 }
 
 // dayView shows one day's entries and lets the user move between days and pick entries.
@@ -55,6 +63,7 @@ func (s *session) dayView(ctx context.Context, mode pickMode, start time.Time) e
 	if !start.IsZero() {
 		day = dayStart(start, loc)
 	}
+	var prevDay, nextDay neighbour
 	for {
 		rows, err := s.store.ListBetween(ctx, day, day.AddDate(0, 0, 1))
 		if err != nil {
@@ -62,7 +71,15 @@ func (s *session) dayView(ctx context.Context, mode pickMode, start time.Time) e
 			return nil
 		}
 		s.renderDay(day, rows, today)
-		s.dayOptions(mode)
+		// The nearest days with entries, shown next to p / n and used by them.
+		var err1, err2 error
+		prevDay.at, prevDay.ok, err1 = s.store.Nearest(ctx, day, true)
+		nextDay.at, nextDay.ok, err2 = s.store.Nearest(ctx, day.AddDate(0, 0, 1), false)
+		if err := errors.Join(err1, err2); err != nil {
+			renderError(s.out, s.st, fmt.Errorf("Couldn't load entries: %v", err))
+			return nil
+		}
+		s.dayOptions(mode, day, prevDay, nextDay)
 
 	input:
 		for {
@@ -79,16 +96,9 @@ func (s *session) dayView(ctx context.Context, mode pickMode, start time.Time) e
 			case actDone:
 				return nil
 			case actPrev, actNext:
-				var at time.Time
-				var ok bool
-				if in.action == actPrev {
-					at, ok, err = s.store.Nearest(ctx, day, true)
-				} else {
-					at, ok, err = s.store.Nearest(ctx, day.AddDate(0, 0, 1), false)
-				}
-				if err != nil {
-					renderError(s.out, s.st, err)
-					continue
+				at, ok := prevDay.at, prevDay.ok
+				if in.action == actNext {
+					at, ok = nextDay.at, nextDay.ok
 				}
 				if !ok {
 					if in.action == actPrev {
@@ -189,24 +199,50 @@ func (s *session) renderDay(day time.Time, rows []store.Transaction, today time.
 		}
 	}
 	sep := "   "
-	rule := indent + s.st.dim(strings.Repeat("─", 1+numW+3*len(sep)+5+7+amtW))
+	cc := newCategoryColumn(rows, sep)
+	nc := newNoteColumn(rows, sep)
+	rule := indent + s.st.dim(strings.Repeat("─", 1+numW+3*len(sep)+5+7+cc.width()+amtW+nc.width()))
 	fmt.Fprintln(s.out, rule)
-	fmt.Fprintln(s.out, indent+" "+s.st.dim(padRight("#", numW)+sep+"Time "+sep+padRight("Type", 7)+sep+padLeft("Amount", amtW)))
+	fmt.Fprintln(s.out, indent+" "+s.st.dim(padRight("#", numW)+sep+"Time "+sep+padRight("Type", 7)+sep+
+		cc.header()+padLeft("Amount", amtW)+nc.header()))
 	for i, tx := range rows {
 		fmt.Fprintln(s.out, indent+" "+padRight(strconv.Itoa(i+1), numW)+sep+tx.OccurredAt.In(s.loc()).Format("15:04")+sep+
-			s.st.kind(tx.Kind, padRight(string(tx.Kind), 7))+sep+padLeft(money.Format(tx.Amount), amtW))
+			s.st.kind(tx.Kind, padRight(string(tx.Kind), 7))+sep+cc.cell(tx.Category)+padLeft(money.Format(tx.Amount), amtW)+nc.cell(tx.Note))
 	}
 	fmt.Fprintln(s.out, rule)
 	fmt.Fprintf(s.out, "%s Income %s · Expenses %s\n", indent, s.st.green(money.Format(income)), s.st.red(money.Format(expenses)))
 }
 
-func (s *session) dayOptions(mode pickMode) {
+// neighbour is the nearest earlier or later day with entries, if any.
+type neighbour struct {
+	at time.Time
+	ok bool
+}
+
+// label names the neighbour's day: "Fri 16 Oct", with the year if it isn't day's year.
+func (n neighbour) label(day time.Time, loc *time.Location) string {
+	t := n.at.In(loc)
+	if t.Year() != day.Year() {
+		return t.Format("Mon 2 Jan 2006")
+	}
+	return t.Format("Mon 2 Jan")
+}
+
+func (s *session) dayOptions(mode pickMode, day time.Time, prev, next neighbour) {
+	loc := s.loc()
+	p, n := s.st.dim("no earlier entries"), s.st.dim("no later entries")
+	if prev.ok {
+		p = "p: previous day, " + s.st.bold(prev.label(day, loc))
+	}
+	if next.ok {
+		n = "n: next day, " + s.st.bold(next.label(day, loc))
+	}
 	fmt.Fprintln(s.out)
-	fmt.Fprintln(s.out, indent+"p: previous day · n: next day · or type a date: 2026-10-15 · 2026-09 · 2025")
+	fmt.Fprintln(s.out, indent+p+" · "+n+" · or type a date: 2026-10-15 · 2026-09 · 2025")
 	if mode == pickDelete {
 		fmt.Fprintln(s.out, indent+"Choose entry number(s) to delete, e.g. 2 or 1 3 · Enter: done")
 	} else {
-		fmt.Fprintln(s.out, indent+"Choose an entry number to edit, e.g. 2 (or 2 expense 27500 2026-10-16 14:33) · Enter: done")
+		fmt.Fprintln(s.out, indent+"Choose an entry number to edit, e.g. 2 (or 2 expense 27500 food 2026-10-16 14:33) · Enter: done")
 	}
 }
 
@@ -264,7 +300,8 @@ func plainAmount(c int64) string {
 
 func (s *session) editEntry(ctx context.Context, n int, row store.Transaction, shortcut *AddCmd) error {
 	loc := s.loc()
-	kind, amount, at := row.Kind, row.Amount, row.OccurredAt.In(loc)
+	kind, amount, at, note := row.Kind, row.Amount, row.OccurredAt.In(loc), row.Note
+	cat := store.Category{ID: row.CategoryID, Kind: row.Kind, Name: row.Category}
 	fmt.Fprintf(s.out, "%s#%d  %s\n", indent, n, s.describe(row))
 
 	if shortcut != nil {
@@ -272,9 +309,29 @@ func (s *session) editEntry(ctx context.Context, n int, row store.Transaction, s
 		if !shortcut.At.IsZero() {
 			at = shortcut.At
 		}
+		if shortcut.HasNote {
+			note = shortcut.Note
+		}
+		switch {
+		case shortcut.Category != "":
+			c, err := s.categoryOf(ctx, *shortcut)
+			if err != nil {
+				renderError(s.out, s.st, err)
+				return nil
+			}
+			cat = c
+		case kind != row.Kind:
+			cat = store.Category{} // it belongs to the other type
+		}
 	} else {
 		var err error
 		if kind, err = askField(s, fmt.Sprintf("Type [%s]: ", row.Kind), kind, parseKind); err != nil {
+			return err
+		}
+		if kind != row.Kind {
+			cat = store.Category{}
+		}
+		if cat, err = s.askCategory(ctx, kind, cat); err != nil {
 			return err
 		}
 		if amount, err = askField(s, fmt.Sprintf("Amount [%s]: ", plainAmount(row.Amount)), amount, money.Parse); err != nil {
@@ -284,6 +341,9 @@ func (s *session) editEntry(ctx context.Context, n int, row store.Transaction, s
 		if at, err = askField(s, fmt.Sprintf("Date & time [%s]: ", at.Format(timeLayout)), at, parseAt); err != nil {
 			return err
 		}
+		if note, err = s.askNote(note); err != nil {
+			return err
+		}
 	}
 
 	type diff struct{ name, from, to string }
@@ -291,11 +351,17 @@ func (s *session) editEntry(ctx context.Context, n int, row store.Transaction, s
 	if kind != row.Kind {
 		diffs = append(diffs, diff{"type", string(row.Kind), string(kind)})
 	}
+	if cat.ID != row.CategoryID {
+		diffs = append(diffs, diff{"category", orNone(row.Category), orNone(cat.Name)})
+	}
 	if amount != row.Amount {
 		diffs = append(diffs, diff{"amount", money.Format(row.Amount), money.Format(amount)})
 	}
 	if !at.Equal(row.OccurredAt) {
 		diffs = append(diffs, diff{"date & time", row.OccurredAt.In(loc).Format(timeLayout), at.Format(timeLayout)})
+	}
+	if note != row.Note {
+		diffs = append(diffs, diff{"note", orNone(row.Note), orNone(note)})
 	}
 	if len(diffs) == 0 {
 		fmt.Fprintln(s.out, indent+"No changes.")
@@ -314,8 +380,13 @@ func (s *session) editEntry(ctx context.Context, n int, row store.Transaction, s
 		return nil
 	}
 
-	up, err := s.store.UpdateTransaction(ctx, row.ID, kind, amount, at, row.UpdatedAt)
+	up, err := s.store.UpdateTransaction(ctx, row.ID,
+		store.NewTransaction{Kind: kind, Amount: amount, OccurredAt: at, Note: note, CategoryID: cat.ID}, row.UpdatedAt)
 	switch {
+	case errors.Is(err, store.ErrCategoryKind):
+		s.reloadCategories(ctx)
+		renderError(s.out, s.st, fmt.Errorf("The category %s was removed elsewhere. Nothing was saved.", cat.Name))
+		return nil
 	case errors.Is(err, store.ErrChanged):
 		renderError(s.out, s.st, errors.New("That entry was changed elsewhere since it was shown. Nothing was saved."))
 		return nil
@@ -333,6 +404,33 @@ func (s *session) editEntry(ctx context.Context, n int, row store.Transaction, s
 	}
 	fmt.Fprintln(s.out, msg)
 	return nil
+}
+
+func orNone(n string) string {
+	if n == "" {
+		return "(none)"
+	}
+	return n
+}
+
+// askNote asks for a note: Enter keeps current, "-" removes it. Quotes are optional here.
+func (s *session) askNote(current string) (string, error) {
+	prompt := "Note (Enter: none): "
+	if current != "" {
+		prompt = fmt.Sprintf("Note [%s] (- to remove): ", current)
+	}
+	return askField(s, prompt, current, func(line string) (string, error) {
+		if line == "-" {
+			return "", nil
+		}
+		if strings.HasPrefix(line, `"`) && strings.HasSuffix(line, `"`) && len(line) >= 2 {
+			line = line[1 : len(line)-1]
+		}
+		if strings.Contains(line, `"`) {
+			return "", errors.New(`A note can't contain the " character.`)
+		}
+		return cleanNote(line)
+	})
 }
 
 // askField asks until the answer parses; Enter keeps def.
@@ -409,17 +507,21 @@ func (s *session) renderTrash(rows []store.Transaction) {
 		amtW = max(amtW, len(money.Format(tx.Amount)))
 	}
 	sep := "   "
+	cc := newCategoryColumn(rows, sep)
+	nc := newNoteColumn(rows, sep)
 	head := padRight("#", numW) + sep + padRight("Deleted", 16) + sep + padRight("Date & time", 16) + sep +
-		padRight("Type", 7) + sep + padLeft("Amount", amtW) + sep + "Removed on"
-	rule := indent + s.st.dim(strings.Repeat("─", 1+len(head)))
+		padRight("Type", 7) + sep + cc.header() + padLeft("Amount", amtW) + sep + "Removed on"
+	rule := indent + s.st.dim(strings.Repeat("─", 1+len(head)+nc.width()))
+	head += nc.header()
 	fmt.Fprintln(s.out, indent+s.st.bold(fmt.Sprintf("Deleted entries (kept %d days)", store.TrashDays)))
 	fmt.Fprintln(s.out, rule)
 	fmt.Fprintln(s.out, indent+" "+s.st.dim(head))
 	for i, tx := range rows {
 		fmt.Fprintln(s.out, indent+" "+padRight(strconv.Itoa(i+1), numW)+sep+
 			tx.DeletedAt.In(loc).Format(timeLayout)+sep+tx.OccurredAt.In(loc).Format(timeLayout)+sep+
-			s.st.kind(tx.Kind, padRight(string(tx.Kind), 7))+sep+padLeft(money.Format(tx.Amount), amtW)+sep+
-			tx.DeletedAt.In(loc).AddDate(0, 0, store.TrashDays).Format("2006-01-02"))
+			s.st.kind(tx.Kind, padRight(string(tx.Kind), 7))+sep+cc.cell(tx.Category)+padLeft(money.Format(tx.Amount), amtW)+sep+
+			padRight(tx.DeletedAt.In(loc).AddDate(0, 0, store.TrashDays).Format("2006-01-02"), len("Removed on"))+
+			nc.cell(tx.Note))
 	}
 	fmt.Fprintln(s.out, rule)
 	fmt.Fprintln(s.out, indent+"Choose entry number(s) to restore, e.g. 1 or 1 2 · Enter: done")
@@ -500,8 +602,7 @@ func (s *session) undo(ctx context.Context) error {
 	}
 	switch c.kind {
 	case "edit":
-		b := c.before
-		_, err = s.store.UpdateTransaction(ctx, b.ID, b.Kind, b.Amount, b.OccurredAt, c.after.UpdatedAt)
+		_, err = s.store.UpdateTransaction(ctx, c.before.ID, c.before.Values(), c.after.UpdatedAt)
 	case "delete":
 		_, err = s.store.RestoreTransactions(ctx, ids)
 	case "restore":
@@ -509,7 +610,7 @@ func (s *session) undo(ctx context.Context) error {
 	}
 	s.lastChange = nil
 	switch {
-	case errors.Is(err, store.ErrChanged), errors.Is(err, store.ErrNotFound):
+	case errors.Is(err, store.ErrChanged), errors.Is(err, store.ErrNotFound), errors.Is(err, store.ErrCategoryKind):
 		renderError(s.out, s.st, errors.New("That changed elsewhere since; undo skipped."))
 	case err != nil:
 		renderError(s.out, s.st, fmt.Errorf("Couldn't undo: %v", err))
@@ -589,15 +690,18 @@ func parseDayInput(line string, loc *time.Location) (dayInput, error) {
 	if nums, err := parseNumbers(line); err == nil {
 		return dayInput{action: actPick, nums: nums}, nil
 	}
-	if n, err := strconv.Atoi(f[0]); err == nil && n >= 1 && len(f) >= 2 {
-		rest := f[1:]
-		switch rest[0] {
+	// Edit shortcut: "<#> <type> <amount> [date time] ["note"]". Uses the original line so
+	// the note keeps its case.
+	first, rest, _ := strings.Cut(strings.TrimSpace(line), " ")
+	if n, err := strconv.Atoi(first); err == nil && n >= 1 && strings.TrimSpace(rest) != "" {
+		word, tail, _ := strings.Cut(strings.TrimSpace(rest), " ")
+		switch strings.ToLower(word) {
 		case "pendapatan":
-			rest[0] = "income"
+			word = "income"
 		case "pengeluaran":
-			rest[0] = "expenses"
+			word = "expenses"
 		}
-		cmd, err := Parse(strings.Join(rest, " "), loc)
+		cmd, err := Parse(word+" "+tail, loc)
 		if err != nil {
 			return dayInput{}, err
 		}

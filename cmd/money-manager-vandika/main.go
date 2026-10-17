@@ -64,26 +64,23 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  ! Couldn't empty old entries from the trash: %v\n", err)
 	}
 
-	var lines cli.LineReader
-	if vt && isTerminal(os.Stdin) {
-		lines = &lineedit.Editor{
-			In:      os.Stdin,
-			Out:     os.Stdout,
-			Raw:     rawMode(os.Stdin),
-			Suggest: cli.Suggest,
-			Color:   color,
-			WakeFn:  wakeConsole(os.Stdin),
-		}
-	}
-
 	repl := &cli.REPL{
 		In:     os.Stdin,
-		Lines:  lines,
 		Out:    os.Stdout,
 		Store:  db,
 		Now:    time.Now,
 		Color:  color,
 		Banner: cli.BannerInfo{Version: version, Name: "Vandika", DB: describeDB(cfg.DatabaseURL)},
+	}
+	if vt && isTerminal(os.Stdin) {
+		repl.Lines = &lineedit.Editor{
+			In:      os.Stdin,
+			Out:     os.Stdout,
+			Raw:     rawMode(os.Stdin),
+			Suggest: repl.Suggest, // knows the categories, for Tab after the amount
+			Color:   color,
+			WakeFn:  wakeConsole(os.Stdin),
+		}
 	}
 	if dir, err := speech.DefaultDir(); err == nil {
 		mgr := speech.NewManager(cfg.EnvPath, dir)

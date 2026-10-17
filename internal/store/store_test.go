@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,15 +16,20 @@ import (
 )
 
 type backend interface {
-	AddTransaction(ctx context.Context, kind Kind, amount int64, occurredAt time.Time) (Transaction, error)
+	AddTransaction(ctx context.Context, v NewTransaction) (Transaction, error)
 	AddTransactions(ctx context.Context, rows []NewTransaction) ([]Transaction, error)
 	Nearest(ctx context.Context, t time.Time, before bool) (time.Time, bool, error)
-	UpdateTransaction(ctx context.Context, id int64, kind Kind, amount int64, occurredAt, expectUpdatedAt time.Time) (Transaction, error)
+	UpdateTransaction(ctx context.Context, id int64, v NewTransaction, expectUpdatedAt time.Time) (Transaction, error)
 	DeleteTransactions(ctx context.Context, ids []int64) ([]Transaction, error)
 	RestoreTransactions(ctx context.Context, ids []int64) ([]Transaction, error)
 	ListDeleted(ctx context.Context) ([]Transaction, error)
 	PurgeDeleted(ctx context.Context, before time.Time) (int, error)
 	ListBetween(ctx context.Context, from, to time.Time) ([]Transaction, error)
+	Categories(ctx context.Context) ([]Category, error)
+	AddCategory(ctx context.Context, kind Kind, name string) (Category, error)
+	RenameCategory(ctx context.Context, id int64, name string) (Category, error)
+	RemoveCategory(ctx context.Context, id, moveTo int64) (int, error)
+	CategoryCounts(ctx context.Context) (map[int64]int, error)
 }
 
 var wib = time.FixedZone("WIB", 7*3600)
@@ -82,6 +88,44 @@ func TestPostgres(t *testing.T) {
 				t.Errorf("insert (%q, %d) succeeded, want CHECK violation", b.kind, b.amount)
 			}
 		}
+		_, err := p.pool.Exec(ctx,
+			`INSERT INTO transactions (kind, amount_cents, occurred_at, note) VALUES ('income', 1, now(), $1)`,
+			strings.Repeat("x", MaxNoteLen+1))
+		if err == nil {
+			t.Error("201-character note accepted by the database")
+		}
+	})
+
+	t.Run("category foreign key checks the kind", func(t *testing.T) {
+		p := openTestSchema(t, base)
+		ctx := context.Background()
+		var food, salary int64
+		p.pool.QueryRow(ctx, `SELECT id FROM categories WHERE kind = 'expense' AND name = 'food'`).Scan(&food)
+		p.pool.QueryRow(ctx, `SELECT id FROM categories WHERE kind = 'income' AND name = 'salary'`).Scan(&salary)
+		if _, err := p.pool.Exec(ctx, `INSERT INTO transactions (kind, amount_cents, occurred_at, category_id)
+			VALUES ('expense', 1, now(), $1)`, food); err != nil {
+			t.Errorf("fitting category refused: %v", err)
+		}
+		if _, err := p.pool.Exec(ctx, `INSERT INTO transactions (kind, amount_cents, occurred_at, category_id)
+			VALUES ('income', 1, now(), $1)`, food); err == nil {
+			t.Error("expense category on an income entry accepted by the database")
+		}
+		if _, err := p.pool.Exec(ctx, `UPDATE transactions SET kind = 'income'`); err == nil {
+			t.Error("kind changed away from its category")
+		}
+		for _, name := range []string{"Food", "none", "two words", "x123456789012345678901", "-x"} {
+			if _, err := p.pool.Exec(ctx, `INSERT INTO categories (kind, name) VALUES ('expense', $1)`, name); err == nil {
+				t.Errorf("category name %q accepted by the database", name)
+			}
+		}
+		if err := p.Migrate(ctx); err != nil {
+			t.Fatal(err)
+		}
+		var n int
+		p.pool.QueryRow(ctx, `SELECT count(*) FROM categories`).Scan(&n)
+		if n != 7 || salary == 0 {
+			t.Errorf("%d categories after a second Migrate, want the 7 built-ins", n)
+		}
 	})
 }
 
@@ -132,7 +176,7 @@ func testBackend(t *testing.T, newBackend func(t *testing.T) backend) {
 	t.Run("add returns stored row", func(t *testing.T) {
 		s := newBackend(t)
 		at := time.Date(2026, 10, 17, 9, 0, 0, 0, wib)
-		tx, err := s.AddTransaction(ctx, Income, 500_000_000, at)
+		tx, err := s.AddTransaction(ctx, NewTransaction{Kind: Income, Amount: 500_000_000, OccurredAt: at})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -146,10 +190,10 @@ func testBackend(t *testing.T, newBackend func(t *testing.T) backend) {
 
 	t.Run("rejects invalid input", func(t *testing.T) {
 		s := newBackend(t)
-		if _, err := s.AddTransaction(ctx, "bogus", 100, oct); err == nil {
+		if _, err := s.AddTransaction(ctx, NewTransaction{Kind: "bogus", Amount: 100, OccurredAt: oct}); err == nil {
 			t.Error("bogus kind accepted")
 		}
-		if _, err := s.AddTransaction(ctx, Expense, 0, oct); err == nil {
+		if _, err := s.AddTransaction(ctx, NewTransaction{Kind: Expense, Amount: 0, OccurredAt: oct}); err == nil {
 			t.Error("zero amount accepted")
 		}
 	})
@@ -158,7 +202,7 @@ func testBackend(t *testing.T, newBackend func(t *testing.T) backend) {
 		s := newBackend(t)
 		add := func(kind Kind, amount int64, at time.Time) {
 			t.Helper()
-			if _, err := s.AddTransaction(ctx, kind, amount, at); err != nil {
+			if _, err := s.AddTransaction(ctx, NewTransaction{Kind: kind, Amount: amount, OccurredAt: at}); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -306,7 +350,7 @@ func testBackend(t *testing.T, newBackend func(t *testing.T) backend) {
 		s := newBackend(t)
 		rows := seed(t, s)
 		newAt := time.Date(2026, 10, 6, 7, 30, 0, 0, wib)
-		up, err := s.UpdateTransaction(ctx, rows[1].ID, Income, 250, newAt, time.Time{})
+		up, err := s.UpdateTransaction(ctx, rows[1].ID, NewTransaction{Kind: Income, Amount: 250, OccurredAt: newAt}, time.Time{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -314,18 +358,18 @@ func testBackend(t *testing.T, newBackend func(t *testing.T) backend) {
 			t.Errorf("updated = %+v", up)
 		}
 		// Editing with the old version (someone else edited meanwhile) is refused.
-		if _, err := s.UpdateTransaction(ctx, rows[1].ID, Expense, 1, newAt, time.Time{}); !errors.Is(err, ErrChanged) {
+		if _, err := s.UpdateTransaction(ctx, rows[1].ID, NewTransaction{Kind: Expense, Amount: 1, OccurredAt: newAt}, time.Time{}); !errors.Is(err, ErrChanged) {
 			t.Errorf("stale update: err = %v", err)
 		}
 		// With the current version it works (this is how undo restores the old values).
-		back, err := s.UpdateTransaction(ctx, rows[1].ID, Expense, 200, rows[1].OccurredAt, up.UpdatedAt)
+		back, err := s.UpdateTransaction(ctx, rows[1].ID, NewTransaction{Kind: Expense, Amount: 200, OccurredAt: rows[1].OccurredAt}, up.UpdatedAt)
 		if err != nil || back.Amount != 200 {
 			t.Errorf("update with current version = %+v, %v", back, err)
 		}
 		// Back-to-back edits (within one clock tick) still get different versions.
 		v := back.UpdatedAt
 		for i := 0; i < 5; i++ {
-			next, err := s.UpdateTransaction(ctx, rows[1].ID, Expense, int64(300+i), rows[1].OccurredAt, v)
+			next, err := s.UpdateTransaction(ctx, rows[1].ID, NewTransaction{Kind: Expense, Amount: int64(300 + i), OccurredAt: rows[1].OccurredAt}, v)
 			if err != nil {
 				t.Fatalf("rapid edit %d: %v", i, err)
 			}
@@ -334,15 +378,73 @@ func testBackend(t *testing.T, newBackend func(t *testing.T) backend) {
 			}
 			v = next.UpdatedAt
 		}
-		if _, err := s.UpdateTransaction(ctx, 999999, Income, 1, newAt, time.Time{}); !errors.Is(err, ErrNotFound) {
+		if _, err := s.UpdateTransaction(ctx, 999999, NewTransaction{Kind: Income, Amount: 1, OccurredAt: newAt}, time.Time{}); !errors.Is(err, ErrNotFound) {
 			t.Errorf("missing: err = %v", err)
 		}
 		s.DeleteTransactions(ctx, []int64{rows[0].ID})
-		if _, err := s.UpdateTransaction(ctx, rows[0].ID, Income, 1, newAt, time.Time{}); !errors.Is(err, ErrNotFound) {
+		if _, err := s.UpdateTransaction(ctx, rows[0].ID, NewTransaction{Kind: Income, Amount: 1, OccurredAt: newAt}, time.Time{}); !errors.Is(err, ErrNotFound) {
 			t.Errorf("deleted: err = %v", err)
 		}
-		if _, err := s.UpdateTransaction(ctx, rows[2].ID, Income, 0, newAt, time.Time{}); err == nil {
+		if _, err := s.UpdateTransaction(ctx, rows[2].ID, NewTransaction{Kind: Income, Amount: 0, OccurredAt: newAt}, time.Time{}); err == nil {
 			t.Error("zero amount accepted")
+		}
+	})
+
+	t.Run("notes are saved, edited and kept through delete and restore", func(t *testing.T) {
+		s := newBackend(t)
+		at := time.Date(2026, 10, 17, 12, 10, 0, 0, wib)
+		tx, err := s.AddTransaction(ctx, NewTransaction{Kind: Expense, Amount: 2_500_000, OccurredAt: at, Note: "makan siang ☕"})
+		if err != nil || tx.Note != "makan siang ☕" {
+			t.Fatalf("add = %+v, %v", tx, err)
+		}
+		batch, err := s.AddTransactions(ctx, []NewTransaction{
+			{Kind: Income, Amount: 100, OccurredAt: at, Note: "gaji oktober"},
+			{Kind: Income, Amount: 200, OccurredAt: at},
+		})
+		if err != nil || batch[0].Note != "gaji oktober" || batch[1].Note != "" {
+			t.Fatalf("batch = %+v, %v", batch, err)
+		}
+
+		v := tx.Values()
+		v.Note = "makan siang kantor"
+		up, err := s.UpdateTransaction(ctx, tx.ID, v, tx.UpdatedAt)
+		if err != nil || up.Note != "makan siang kantor" || up.Amount != tx.Amount {
+			t.Fatalf("update = %+v, %v", up, err)
+		}
+		v.Note = ""
+		cleared, err := s.UpdateTransaction(ctx, tx.ID, v, up.UpdatedAt)
+		if err != nil || cleared.Note != "" {
+			t.Fatalf("clear = %+v, %v", cleared, err)
+		}
+
+		s.DeleteTransactions(ctx, []int64{batch[0].ID})
+		trash, _ := s.ListDeleted(ctx)
+		if len(trash) != 1 || trash[0].Note != "gaji oktober" {
+			t.Errorf("trash = %+v", trash)
+		}
+		restored, _ := s.RestoreTransactions(ctx, []int64{batch[0].ID})
+		if len(restored) != 1 || restored[0].Note != "gaji oktober" {
+			t.Errorf("restored = %+v", restored)
+		}
+		got, _ := s.ListBetween(ctx, oct, nov)
+		notes := map[int64]string{}
+		for _, r := range got {
+			notes[r.ID] = r.Note
+		}
+		if notes[batch[0].ID] != "gaji oktober" || notes[tx.ID] != "" {
+			t.Errorf("listed notes = %v", notes)
+		}
+	})
+
+	t.Run("note length is limited", func(t *testing.T) {
+		s := newBackend(t)
+		ok := strings.Repeat("é", MaxNoteLen) // characters, not bytes
+		if _, err := s.AddTransaction(ctx, NewTransaction{Kind: Income, Amount: 1, OccurredAt: oct, Note: ok}); err != nil {
+			t.Errorf("200-character note rejected: %v", err)
+		}
+		long := ok + "x"
+		if _, err := s.AddTransaction(ctx, NewTransaction{Kind: Income, Amount: 1, OccurredAt: oct, Note: long}); err == nil {
+			t.Error("201-character note accepted")
 		}
 	})
 
@@ -376,4 +478,6 @@ func testBackend(t *testing.T, newBackend func(t *testing.T) backend) {
 			t.Errorf("got %d rows, want 0", len(got))
 		}
 	})
+
+	testCategories(t, newBackend)
 }

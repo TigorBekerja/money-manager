@@ -1,6 +1,7 @@
 package voice
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -124,6 +125,128 @@ func TestInterpretRejects(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), tt.wantErr) {
 			t.Errorf("Interpret(%q) error = %q, want %q", tt.text, err, tt.wantErr)
+		}
+	}
+}
+
+func TestInterpretNote(t *testing.T) {
+	tests := []struct {
+		text   string
+		amount int64 // rupiah
+		note   string
+	}{
+		{"pengeluaran dua puluh lima ribu makan siang", 25_000, "makan siang"},
+		{"Pengeluaran dua puluh lima ribu, makan siang.", 25_000, "makan siang"},
+		{"pengeluaran lima puluh ribu buat makan", 50_000, "buat makan"}, // kept as said
+		{"pendapatan lima juta gaji oktober", 5_000_000, "gaji oktober"},
+		{"pengeluaran dua puluh lima ribu rupiah makan", 25_000, "makan"}, // rupiah belongs to the amount
+		{"pengeluaran 25.000 makan siang", 25_000, "makan siang"},
+		{"expenses Rp 25.000 bensin", 25_000, "bensin"},
+		{"pengeluaran lima puluh ribu beli kopi seribu", 50_000, "beli kopi seribu"}, // number words inside the note
+		{"pengeluaran lima puluh ribu beli dua kopi", 50_000, "beli dua kopi"},
+		{"income dua ratus ribu", 200_000, ""},
+		{"income dua ratus ribu rupiah", 200_000, ""},
+	}
+	for _, tt := range tests {
+		d, err := Interpret(tt.text, at)
+		if err != nil {
+			t.Errorf("Interpret(%q) error: %v", tt.text, err)
+			continue
+		}
+		if d.Amount != tt.amount*100 || d.Note != tt.note {
+			t.Errorf("Interpret(%q) = %d %q, want %d %q", tt.text, d.Amount/100, d.Note, tt.amount, tt.note)
+		}
+	}
+
+	long := "income seribu " + strings.Repeat("kata ", 60)
+	if d, err := Interpret(long, at); err != nil || len([]rune(d.Note)) != 200 {
+		t.Errorf("long note: %d characters, %v; want cut to 200", len([]rune(d.Note)), err)
+	}
+	// A misheard scale word right after the amount still rejects the entry.
+	if _, err := Interpret("pengeluaran dua ratus rebu makan", at); err == nil {
+		t.Error("dua ratus rebu makan accepted")
+	}
+}
+
+func TestInterpretCategory(t *testing.T) {
+	mem := store.NewMemory()
+	mem.AddCategory(context.Background(), store.Expense, "parkir")
+	mem.AddCategory(context.Background(), store.Expense, "uang-sekolah")
+	cats, _ := mem.Categories(context.Background())
+	in := Interpreter{Categories: cats}
+	tests := []struct {
+		text     string
+		amount   int64 // rupiah
+		category string
+		note     string
+	}{
+		{"pengeluaran lima puluh ribu makanan nasi padang", 50_000, "food", "nasi padang"}, // taken out of the note
+		{"pengeluaran lima puluh ribu food", 50_000, "food", ""},
+		{"pengeluaran dua puluh ribu minuman es teh", 20_000, "drink", "es teh"},
+		{"pengeluaran dua puluh ribu rupiah minuman", 20_000, "drink", ""},
+		{"pendapatan lima juta gaji oktober", 5_000_000, "salary", "oktober"},
+		{"pengeluaran lima belas ribu pencuci mulut es krim", 15_000, "dessert", "es krim"}, // two-word alias
+		{"pengeluaran lima belas ribu makanan penutup puding", 15_000, "dessert", "puding"}, // longest match wins over food
+		{"pengeluaran lima puluh ribu langanan netflix", 50_000, "subscription", "netflix"}, // one letter off, 6+ letters
+		{"pengeluaran tiga puluh ribu transportasi ojek", 30_000, "transport", "ojek"},
+		{"pengeluaran lima ribu parkir", 5_000, "parkir", ""}, // the user's own
+		{"pengeluaran satu juta uang sekolah", 1_000_000, "uang-sekolah", ""},
+		{"pengeluaran lima puluh ribu buat makan", 50_000, "", "buat makan"},
+		{"pengeluaran lima puluh ribu makan siang", 50_000, "", "makan siang"}, // "makan" isn't "makanan"
+		{"pengeluaran lima ribu gaji supir", 5_000, "", "gaji supir"},          // salary is for income
+		{"pendapatan lima ribu makanan", 5_000, "", "makanan"},                 // food is for expenses
+		{"pengeluaran lima ribu beli makanan", 5_000, "", "beli makanan"},      // only right after the amount
+		{"pengeluaran lima ribu parkr", 5_000, "parkir", ""},                   // one letter off, 6+ letters
+		{"pengeluaran lima ribu fod", 5_000, "", "fod"},                        // short words must be exact
+		{"pengeluaran lima ribu gajih", 5_000, "", "gajih"},
+	}
+	for _, tt := range tests {
+		d, err := in.Interpret(tt.text, at)
+		if err != nil {
+			t.Errorf("Interpret(%q) error: %v", tt.text, err)
+			continue
+		}
+		if d.Amount != tt.amount*100 || d.Category != tt.category || d.Note != tt.note {
+			t.Errorf("Interpret(%q) = %d %q %q, want %d %q %q", tt.text, d.Amount/100, d.Category, d.Note, tt.amount, tt.category, tt.note)
+		}
+		if (d.CategoryID != 0) != (tt.category != "") {
+			t.Errorf("Interpret(%q): CategoryID = %d", tt.text, d.CategoryID)
+		}
+	}
+	// The misheard-number guard still applies when no category follows the amount.
+	if _, err := in.Interpret("pengeluaran dua ratus rebu makanan", at); err == nil {
+		t.Error("dua ratus rebu makanan accepted")
+	}
+	// Without categories (the package-level Interpret) the words stay in the note.
+	if d, _ := Interpret("pengeluaran lima puluh ribu makanan nasi padang", at); d.Category != "" || d.Note != "makanan nasi padang" {
+		t.Errorf("without categories: %+v", d)
+	}
+}
+
+func TestSplit(t *testing.T) {
+	tests := []struct {
+		text    string
+		entries []string
+		stop    bool
+	}{
+		{"Pengeluaran lima puluh ribu, makan siang.", []string{"Pengeluaran lima puluh ribu, makan siang."}, false}, // as is
+		{"stop", nil, true},
+		{"Oke, berhenti.", nil, true},
+		{"pengeluaran lima puluh ribu makan siang. Stop.", []string{"pengeluaran lima puluh ribu makan siang"}, true},
+		{"income seribu berhenti oke", []string{"income seribu"}, true},
+		{"income seribu stop dulu", []string{"income seribu stop dulu"}, false}, // stop must be last
+		{"pengeluaran lima puluh ribu makan siang pendapatan dua juta gaji",
+			[]string{"pengeluaran lima puluh ribu makan siang", "pendapatan dua juta gaji"}, false},
+		{"income seribu, expenses 25.000 bensin, pengeluran dua ribu parkir. Stop.",
+			[]string{"income seribu", "expenses 25.000 bensin", "pengeluran dua ribu parkir"}, true},
+		{"pengeluaran lima puluh ribu biaya pengeluaran kantor", // no amount after the second: a note
+			[]string{"pengeluaran lima puluh ribu biaya pengeluaran kantor"}, false},
+		{"beli kopi stop", []string{"beli kopi"}, true},
+	}
+	for _, tt := range tests {
+		entries, stop := Split(tt.text)
+		if strings.Join(entries, "|") != strings.Join(tt.entries, "|") || stop != tt.stop {
+			t.Errorf("Split(%q) = %q, %v; want %q, %v", tt.text, entries, stop, tt.entries, tt.stop)
 		}
 	}
 }
